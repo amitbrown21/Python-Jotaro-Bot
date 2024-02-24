@@ -1,5 +1,6 @@
 # Python-Jotaro-Bot
 Introduction
+
 Jotaro is a Discord bot inspired by the character Jotaro Kujo from JoJo's Bizarre Adventure. It offers various features, including:
 
 Playing music from YouTube searches or URLs.
@@ -23,6 +24,7 @@ skip: Skips to the next song in the queue.
 queue: Displays the current queue of songs.
 clear_queue: Clears the current queue.
 remove_last: Removes the last song from the queue.
+
 Other Commands:
 
 ping: Responds with "Pong @" followed by the user's mention.
