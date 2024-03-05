@@ -33,3 +33,6 @@ Usage
 Invite Jotaro to your Discord server: Obtain the bot's invite link and add it to your server.
 Grant necessary permissions: Ensure Jotaro has the required permissions to function properly, such as connecting to voice channels and managing messages.
 Use slash commands: Prefix your commands with a forward slash ("/") followed by the command name and any required arguments.
+
+
+// Added the ability to play youtube playlists 
