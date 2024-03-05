@@ -17,10 +17,12 @@ class music_cog(commands.Cog):
         self.yt_dl_opts = {
             'format': 'bestaudio',
             'postprocessors': [{'key': 'FFmpegExtractAudio'}]}
+
         self.ffmpeg_options = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
                                'options': '-vn', }
         self.ytdl = yt_dlp.YoutubeDL(self.yt_dl_opts)
         self.is_skipping = False
+        self.is_stopping = False
 
     async def print_queue(self, interaction):
         if self.queues:
@@ -32,7 +34,7 @@ class music_cog(commands.Cog):
             embed = discord.Embed(title="Current Queue", description=queue_info, color=0x3498db)
             await interaction.response.send_message(embed=embed)
         else:
-            await interaction.response.send_message("The queue is empty.")
+            await interaction.response.send_message("The queue is empty.", ephemeral=True)
 
     async def check_q(self):
         if len(self.queues) != 0:
@@ -41,9 +43,10 @@ class music_cog(commands.Cog):
             return False
 
     def after_play(self, interaction):
-        if not self.is_skipping:
+        if not self.is_skipping or not self.is_stopping:
             asyncio.run_coroutine_threadsafe(self.play_q(interaction), self.client.loop)
         else:
+            self.is_stopping = False
             self.is_skipping = False
 
     async def play_q(self, interaction):
@@ -80,8 +83,9 @@ class music_cog(commands.Cog):
 
     def search_yt(self, item):
         if item.startswith("https://"):
-            title = self.ytdl.extract_info(item, download=False)["title"]
-            return {'source': item, 'title': title}
+            ishttp = True
+            return {'source': item}
+        ishttp = False
         search = VideosSearch(item, limit=1)
         results = search.result()["result"]
 
@@ -89,7 +93,7 @@ class music_cog(commands.Cog):
             return None
 
         first_result = results[0]
-        return {'source': first_result["link"], 'title': first_result["title"]}
+        return {'source': first_result["link"]}
 
     @app_commands.command(name="play", description="Play a song using YouTube search or URL")
     async def play(self, interaction: discord.Interaction, query: str):
@@ -109,45 +113,109 @@ class music_cog(commands.Cog):
                 if not search_result:
                     await interaction.response.send_message("No search results found.")
                     return
-                await interaction.response.defer()
-                await interaction.followup.send("Hold on, loading...")
+
+                await interaction.response.defer(thinking=True)
                 info = self.ytdl.extract_info(search_result['source'], download=False)
-                thumbnail = info['thumbnail']
-                url = info['url']
-                # Sending the message that contains the song information
-                embed = discord.Embed(title=search_result['title'], url=search_result['source'],
-                                      description="Now Playing...", color=0xffff00)
-                embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.avatar)
-                embed.set_thumbnail(url=thumbnail)
-                await interaction.followup.send(embed=embed)
-                await self.client.change_presence(status=discord.Status.do_not_disturb,
-                                                  activity=discord.Game(name=search_result['title']))
-                # Where the song is played
-                voice.is_playing()
-                song = FFmpegPCMAudio(url, **self.ffmpeg_options)
-                voice.play(song, after=lambda x=None: self.after_play(interaction))
-                voice.is_playing()
+                if info.get('_type') == 'playlist':
+                    # Play the first song from the playlist
+                    first_song = info['entries'][0]
+                    song_url = first_song['url']
+                    url = first_song['webpage_url']
+                    title = first_song['title']
+                    thumbnail = first_song['thumbnail']
+
+                    # Send the message that contains the song information
+                    embed = discord.Embed(title=title, url=url, description="Now Playing...", color=0xffff00)
+                    embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.avatar)
+                    embed.set_thumbnail(url=thumbnail)
+                    await interaction.followup.send(embed=embed)
+                    await self.client.change_presence(status=discord.Status.do_not_disturb,
+                                                      activity=discord.Game(name=title))
+
+                    # Play the first song
+                    song = FFmpegPCMAudio(song_url, **self.ffmpeg_options)
+                    voice.play(song, after=lambda x=None: asyncio.create_task(self.after_play(interaction)))
+                    voice.is_playing()
+                    # Add the rest of the playlist to the queue
+                    for entry in info['entries'][1:]:
+                        song_url = entry['webpage_url']
+                        url = entry['url']
+                        title = entry['title']
+                        thumbnail = entry['thumbnail']
+                        song_position = len(self.queues) + 1
+                        self.queues[song_position] = {'title': title,
+                                                      'audio': FFmpegPCMAudio(url, **self.ffmpeg_options),
+                                                      'url': song_url, 'thumbnail': thumbnail}
+                    return
+                else:
+                    title = info['title']
+                    thumbnail = info['thumbnail']
+                    url = info['url']
+                    # Sending the message that contains the song information
+                    embed = discord.Embed(title=title, url=search_result['source'],
+                                          description="Now Playing...", color=0xffff00)
+                    embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.avatar)
+                    embed.set_thumbnail(url=thumbnail)
+                    await interaction.followup.send(embed=embed)
+                    await self.client.change_presence(status=discord.Status.do_not_disturb,
+                                                      activity=discord.Game(name=title))
+                    # Where the song is played
+                    voice.is_playing()
+                    song = FFmpegPCMAudio(url, **self.ffmpeg_options)
+                    voice.play(song, after=lambda x=None: self.after_play(interaction))
+                    voice.is_playing()
             else:
                 # here we add the song to the queue
                 search_result = self.search_yt(query)
                 if not search_result:
                     await interaction.response.send_message("No search results found.")
                     return
-                await interaction.response.defer()
-                await interaction.followup.send("Hold on, loading...")
+
+                await interaction.response.defer(thinking=True)
+
                 info = self.ytdl.extract_info(search_result['source'], download=False)
-                url = info['url']
-                thumbnail = info['thumbnail']
-                song = FFmpegPCMAudio(url, **self.ffmpeg_options)
-                embed = discord.Embed(title=search_result['title'], url=search_result['source'],
-                                      description="Was added to queue", color=0xffff00)
-                embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.avatar)
-                embed.set_thumbnail(url=thumbnail)
-                await interaction.followup.send(embed=embed)
-                song_position = len(self.queues) + 1
-                self.queues[song_position] = {'title': search_result['title'], 'audio': song,
-                                              'url': search_result['source'], 'thumbnail': thumbnail}
-                return
+                if info.get('_type') == 'playlist':
+                    # Play the first song from the playlist
+                    playlist_name = info['title']
+                    playlist_length = info['playlist_count']
+                    first_song = info['entries'][0]
+                    first_song_name = first_song['title']
+                    thumbnail = first_song['thumbnail']
+                    url = info['webpage_url']
+
+                    # Send the message that contains the song information
+                    embed = discord.Embed(title=playlist_name, url=url, description="Now Playing...", color=0xffff00)
+                    embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.avatar)
+                    embed.set_thumbnail(url=thumbnail)
+                    embed.set_footer(text=f'Playlist length -{playlist_length}')
+                    await interaction.followup.send(embed=embed)
+                    await self.client.change_presence(status=discord.Status.do_not_disturb,
+                                                      activity=discord.Game(name=first_song_name))
+                    # Add the  playlist to the queue
+                    for entry in info['entries']:
+                        song_url = entry['webpage_url']
+                        url = entry['url']
+                        title = entry['title']
+                        thumbnail = entry['thumbnail']
+                        song_position = len(self.queues) + 1
+                        self.queues[song_position] = {'title': title,
+                                                      'audio': FFmpegPCMAudio(url, **self.ffmpeg_options),
+                                                      'url': song_url, 'thumbnail': thumbnail}
+                    return
+                else:
+                    title = info['title']
+                    url = info['url']
+                    thumbnail = info['thumbnail']
+                    song = FFmpegPCMAudio(url, **self.ffmpeg_options)
+                    embed = discord.Embed(title=title, url=search_result['source'],
+                                          description="Was added to queue", color=0xffff00)
+                    embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.avatar)
+                    embed.set_thumbnail(url=thumbnail)
+                    await interaction.followup.send(embed=embed)
+                    song_position = len(self.queues) + 1
+                    self.queues[song_position] = {'title': title, 'audio': song,
+                                                  'url': search_result['source'], 'thumbnail': thumbnail}
+                    return
         else:
             await interaction.response.send_message("You are not in a voice channel.")
             return
@@ -167,7 +235,7 @@ class music_cog(commands.Cog):
             voice.pause()
             await interaction.response.send_message("Paused, Baka Yaro")
         else:
-            await interaction.response.send_message("No Audio is playing")
+            await interaction.response.send_message("No Audio is playing", ephemeral=True)
 
     @app_commands.command(name="resume", description="Resume Jotaro's audio")
     async def resume(self, interaction: discord.Interaction):
@@ -182,6 +250,8 @@ class music_cog(commands.Cog):
     async def stop(self, interaction: discord.Interaction):
         voice = interaction.guild.voice_client
         if voice and (voice.is_paused() or voice.is_playing()):
+            self.is_stopping = True
+            await voice.disconnect()
             voice.stop()
             await self.client.change_presence(status=discord.Status.do_not_disturb)
             await interaction.response.send_message("Yare Yare... I'll be back")
@@ -196,14 +266,13 @@ class music_cog(commands.Cog):
             if voice.is_playing():
                 boolean = await self.check_q()
                 if not boolean:
-                    await interaction.response.send_message("No songs in queue")
+                    await interaction.response.send_message("No songs in queue", ephemeral=True)
                 else:
-                    await interaction.response.defer()
                     self.is_skipping = True
+                    await interaction.response.send_message("Skipping..", ephemeral=True)
                     voice.stop()
-                    await self.play_q(interaction)
             else:
-                await interaction.response.send_message("Nothing is playing..")
+                await interaction.response.send_message("Nothing is playing..", ephemeral=True)
 
         else:
             await interaction.response.send_message("Yaro, Im not in a voice channel..")
@@ -214,12 +283,8 @@ class music_cog(commands.Cog):
 
     @app_commands.command(name="clear_queue", description="Clear the current queue")
     async def clear_queue(self, interaction: discord.Interaction):
-        flag = self.check_q()
-        if not flag:
-            self.queues = {}  # Clear the queue by assigning an empty dictionary
-            await interaction.response.send_message("Queue cleared.")
-        else:
-            await interaction.response.send_message("The queue is already empty.")
+        self.queues = {}  # Clear the queue by assigning an empty dictionary
+        await interaction.response.send_message("Queue cleared.", ephemeral=True)
 
     @app_commands.command(name="remove_last", description="Remove the last song in the queue")
     async def remove_last(self, interaction: discord.Interaction):
@@ -228,7 +293,7 @@ class music_cog(commands.Cog):
             last_song = self.queues.popitem()
             await interaction.response.send_message(f"Removed: {last_song[1]['title']} from the queue.")
         else:
-            await interaction.response.send_message("The queue is empty.")
+            await interaction.response.send_message("The queue is empty.", ephemeral=True)
 
 
 async def setup(bot):
