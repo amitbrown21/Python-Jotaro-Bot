@@ -43,11 +43,17 @@ class music_cog(commands.Cog):
             return False
 
     def after_play(self, interaction):
+
         if not self.is_skipping or not self.is_stopping:
             asyncio.run_coroutine_threadsafe(self.play_q(interaction), self.client.loop)
         else:
+
             self.is_stopping = False
             self.is_skipping = False
+
+    async def c_presence(self, interaction):
+        if self.queues == []:
+            await self.client.change_presence(status=discord.Status.do_not_disturb, activity=None)
 
     async def play_q(self, interaction):
         try:
@@ -75,6 +81,8 @@ class music_cog(commands.Cog):
                 else:
                     await interaction.followup.send("Owari Da... no more songs in the queue")
                     return
+            else:
+                await self.c_presence(interaction)
 
         except Exception as e:
             print(f"An error occurred during play_q: {e}")
@@ -97,6 +105,9 @@ class music_cog(commands.Cog):
 
     @app_commands.command(name="play", description="Play a song using YouTube search or URL")
     async def play(self, interaction: discord.Interaction, query: str):
+        # Defer the interaction immediately
+        await interaction.response.defer()
+
         if interaction.user.voice:
             channel = interaction.user.voice.channel
             voice = discord.utils.get(self.client.voice_clients, guild=interaction.guild)
@@ -108,13 +119,12 @@ class music_cog(commands.Cog):
                 # Bot is not in a voice channel, connect to the specified channel
                 voice = await channel.connect()
 
-            if not voice.is_playing():
+            if not voice.is_playing() and not voice.is_paused():
                 search_result = self.search_yt(query)
                 if not search_result:
-                    await interaction.response.send_message("No search results found.")
+                    await interaction.followup.send("No search results found.")
                     return
 
-                await interaction.response.defer(thinking=True)
                 info = self.ytdl.extract_info(search_result['source'], download=False)
                 if info.get('_type') == 'playlist':
                     # Play the first song from the playlist
@@ -129,7 +139,7 @@ class music_cog(commands.Cog):
                     embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.avatar)
                     embed.set_thumbnail(url=thumbnail)
                     await interaction.followup.send(embed=embed)
-                    await self.client.change_presence(status=discord.Status.do_not_disturb,
+                    await self.client.change_presence(status=discord.Status.online,
                                                       activity=discord.Game(name=title))
 
                     # Play the first song
@@ -168,10 +178,8 @@ class music_cog(commands.Cog):
                 # here we add the song to the queue
                 search_result = self.search_yt(query)
                 if not search_result:
-                    await interaction.response.send_message("No search results found.")
+                    await interaction.followup.send("No search results found.")
                     return
-
-                await interaction.response.defer(thinking=True)
 
                 info = self.ytdl.extract_info(search_result['source'], download=False)
                 if info.get('_type') == 'playlist':
@@ -217,12 +225,12 @@ class music_cog(commands.Cog):
                                                   'url': search_result['source'], 'thumbnail': thumbnail}
                     return
         else:
-            await interaction.response.send_message("You are not in a voice channel.")
+            await interaction.followup.send("You are not in a voice channel.", ephemeral=True)
             return
 
     @app_commands.command(name="leave", description="Make Jotaro leave the voice channel")
     async def leave(self, interaction: discord.Interaction):
-        if interaction.guile.voice_client:
+        if interaction.guild.voice_client:
             await interaction.voice_client.disconnect()
             await interaction.response.send_message("Yare Yare... I'll be back")
         else:
@@ -252,6 +260,7 @@ class music_cog(commands.Cog):
         if voice and (voice.is_paused() or voice.is_playing()):
             self.is_stopping = True
             await voice.disconnect()
+            self.queues = {}
             voice.stop()
             await self.client.change_presence(status=discord.Status.do_not_disturb)
             await interaction.response.send_message("Yare Yare... I'll be back")
@@ -294,6 +303,50 @@ class music_cog(commands.Cog):
             await interaction.response.send_message(f"Removed: {last_song[1]['title']} from the queue.")
         else:
             await interaction.response.send_message("The queue is empty.", ephemeral=True)
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after):
+        # Check if the bot is the only member in the voice channel
+        if before.channel and len(before.channel.members) == 1:
+            # If the bot is alone, disconnect from the voice channel
+            voice_client = discord.utils.get(self.client.voice_clients, guild=before.channel.guild)
+            if voice_client and voice_client.channel:
+                self.queues = {}
+                await voice_client.disconnect()
+                await self.client.change_presence(status=discord.Status.do_not_disturb)
+                # Automatically find the general channel and send a message
+                general_channel = self.find_general_channel(before.channel.guild)
+                if general_channel:
+                    await general_channel.send("I'm alone here, leaving the voice channel.")
+                else:
+                    print("General channel not found.")
+            else:
+                print("I'm not connected to a voice channel.")
+
+    @app_commands.command(name="localplay", description="Play a local mp3")
+    async def localplay(self, interaction: discord.Interaction, filename: str):
+        await interaction.response.defer()
+        if interaction.user.voice:
+            channel = interaction.user.voice.channel
+            voice = discord.utils.get(self.client.voice_clients, guild=interaction.guild)
+
+            if voice and voice.is_connected():
+                # Bot is already in a voice channel
+                pass
+            else:
+                # Bot is not in a voice channel, connect to the specified channel
+                voice = await channel.connect()
+
+            song_path = f"{filename}.wav"  # Assuming mp3 file extension
+            try:
+                voice.play(discord.FFmpegPCMAudio(song_path, executable="ffmpeg.exe"),
+                           after=lambda x=None: self.after_play(interaction))
+                voice.is_playing()
+                await interaction.followup.send(f"Now playing: {filename}")
+            except Exception as e:
+                await interaction.followup.send(f"Error playing {filename}: {e}")
+        else:
+            await interaction.followup.send("You are not in a voice channel.", ephemeral=True)
 
 
 async def setup(bot):
