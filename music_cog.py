@@ -15,9 +15,8 @@ class music_cog(commands.Cog):
         self.client = client
         self.queues = {}
         self.yt_dl_opts = {
-            'format': 'bestaudio',
-            'postprocessors': [{'key': 'FFmpegExtractAudio'}]}
-
+            'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio[ext=ogg]',
+        'buffer_size': 512*512 }
         self.ffmpeg_options = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
                                'options': '-vn', }
         self.ytdl = yt_dlp.YoutubeDL(self.yt_dl_opts)
@@ -337,7 +336,7 @@ class music_cog(commands.Cog):
                 # Bot is not in a voice channel, connect to the specified channel
                 voice = await channel.connect()
 
-            song_path = f"{filename}.wav"  # Assuming mp3 file extension
+            song_path = f"{filename}.mp3"  # Assuming mp3 file extension
             try:
                 voice.play(discord.FFmpegPCMAudio(song_path, executable="ffmpeg.exe"),
                            after=lambda x=None: self.after_play(interaction))
