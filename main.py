@@ -1,4 +1,8 @@
 import discord
+import music_cog
+import dnd_cog
+import admin_cog
+import config
 from discord.ext import commands
 
 from admin_cog import admin_cog

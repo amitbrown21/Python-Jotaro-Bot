@@ -16,7 +16,8 @@ class music_cog(commands.Cog):
         self.queues = {}
         self.yt_dl_opts = {
             'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio[ext=ogg]',
-        'buffer_size': 512*512 }
+        'buffer_size': 2048*2048,
+        'extractor_retries': 3}
         self.ffmpeg_options = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
                                'options': '-vn', }
         self.ytdl = yt_dlp.YoutubeDL(self.yt_dl_opts)
@@ -34,6 +35,14 @@ class music_cog(commands.Cog):
             await interaction.response.send_message(embed=embed)
         else:
             await interaction.response.send_message("The queue is empty.", ephemeral=True)
+
+    def find_general_channel(self, guild):
+        # Iterate through all text channels in the guild
+        for channel in guild.text_channels:
+            # Check if 'general' is part of the channel name (case insensitive)
+            if 'general' in channel.name.lower():
+                return channel  # Return the first matching channel
+        return None  # Return None if no general channel is found
 
     async def check_q(self):
         if len(self.queues) != 0:
