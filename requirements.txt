@@ -1,3 +1,5 @@
-discord.py==2.3.2
+discord.py[voice]==2.3.2
 youtube_search_python==1.6.6
 yt_dlp==2024.4.9
+discord~=2.3.2
+youtube-search-python==1.6.6

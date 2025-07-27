@@ -4,7 +4,8 @@ import dnd_cog
 import admin_cog
 import config
 from discord.ext import commands
-
+import asyncio
+import sys
 from admin_cog import admin_cog
 from config import TOKEN, prefix, guild_ids
 from dnd_cog import dnd_cog
@@ -14,7 +15,8 @@ intents = discord.Intents.all()
 intents.message_content = True
 
 client = commands.Bot(command_prefix=prefix, intents=intents)
-
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 @client.command(pass_context=True)
 async def set_prefix(ctx, new_prefix: str):

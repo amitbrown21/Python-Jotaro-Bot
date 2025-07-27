@@ -3,9 +3,9 @@ import traceback
 
 import discord
 import yt_dlp
-from discord import FFmpegPCMAudio
 from discord import app_commands
 from discord.ext import commands
+from discord import FFmpegPCMAudio
 from youtubesearchpython import VideosSearch
 
 
@@ -347,7 +347,7 @@ class music_cog(commands.Cog):
 
             song_path = f"{filename}.mp3"  # Assuming mp3 file extension
             try:
-                voice.play(discord.FFmpegPCMAudio(song_path, executable="ffmpeg.exe"),
+                voice.play(FFmpegPCMAudio(song_path, executable="ffmpeg.exe"),
                            after=lambda x=None: self.after_play(interaction))
                 voice.is_playing()
                 await interaction.followup.send(f"Now playing: {filename}")
