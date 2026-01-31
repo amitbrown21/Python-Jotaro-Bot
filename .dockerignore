@@ -1,0 +1,52 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Python cache
+__pycache__
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+*.egg-info
+
+# Environment
+.env
+.env.local
+.venv
+venv
+env
+
+# Large binary files (FFmpeg is installed in container)
+ffmpeg.exe
+ffmpeg
+
+# Audio files (test files, not needed in production)
+*.mp3
+*.wav
+*.ogg
+*.m4a
+*.webm
+
+# Temp files
+temp.py
+musictemp.py
+*.spec
+
+# Build artifacts
+build
+dist
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Cache
+.yt_cache

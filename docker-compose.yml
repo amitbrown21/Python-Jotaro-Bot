@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  jotaro-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jotaro-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - BOT_PREFIX=${BOT_PREFIX:-/}
+      - GUILD_IDS=${GUILD_IDS}
+    volumes:
+      # Mount yt-dlp cache for faster metadata retrieval
+      - yt_cache:/app/.yt_cache
+    # Resource limits for stability
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+volumes:
+  yt_cache:
+    driver: local
