@@ -326,6 +326,8 @@ class music_cog(commands.Cog):
         song: SongInfo,
         interaction: discord.Interaction,
     ):
+        # FFmpegPCMAudio cannot be replayed after stop; always build a fresh source.
+        song._audio = None
         vol = self.get_volume_percent(voice.channel.id) / 100.0
         source = discord.PCMVolumeTransformer(song.audio, volume=vol)
         voice.play(source, after=lambda x=None: self.after_play(interaction))
@@ -352,6 +354,22 @@ class music_cog(commands.Cog):
                 return channel
         return None
 
+    async def _announce(self, interaction: discord.Interaction, *args, **kwargs):
+        """Best-effort announce; interaction followups expire (~15m) and must not block play."""
+        try:
+            await interaction.followup.send(*args, **kwargs)
+            return
+        except Exception as e:
+            print(f"announce followup failed: {e}")
+        channel = interaction.channel
+        if channel is None and interaction.guild:
+            channel = self.find_general_channel(interaction.guild)
+        if channel is not None:
+            try:
+                await channel.send(*args, **kwargs)
+            except Exception as e:
+                print(f"announce channel send failed: {e}")
+
     def after_play(self, interaction: discord.Interaction):
         # stopping: queue cleared — do not advance.
         # skipping or natural end: clear skip flag, then play_next.
@@ -370,27 +388,43 @@ class music_cog(commands.Cog):
     async def play_next(self, interaction: discord.Interaction):
         try:
             queue = self.get_queue(interaction.guild_id)
-            voice = interaction.guild.voice_client
+            voice = interaction.guild.voice_client if interaction.guild else None
 
             if not voice:
                 return
 
             song = queue.pop_next()
             if song:
-                await self.client.change_presence(
-                    activity=discord.Game(name=song.title)
-                )
-                await interaction.followup.send(
-                    embed=self.song_embed(song, interaction, "Now Playing...")
-                )
+                try:
+                    await self.client.change_presence(
+                        activity=discord.Game(name=song.title)
+                    )
+                except Exception as e:
+                    print(f"play_next presence failed: {e}")
+
+                # Play first so expired interaction tokens cannot leave the bot silent.
                 self.play_audio(voice, song, interaction)
+                await self._announce(
+                    interaction,
+                    embed=self.song_embed(song, interaction, "Now Playing..."),
+                )
             else:
-                await self.client.change_presence(status=discord.Status.do_not_disturb)
-                await interaction.followup.send("Owari Da... no more songs in the queue")
+                try:
+                    await self.client.change_presence(
+                        status=discord.Status.do_not_disturb
+                    )
+                except Exception as e:
+                    print(f"play_next presence failed: {e}")
+                await self._announce(
+                    interaction, "Owari Da... no more songs in the queue"
+                )
 
         except Exception as e:
             print(f"An error occurred during play_next: {e}")
-            await self.client.change_presence(status=discord.Status.do_not_disturb)
+            try:
+                await self.client.change_presence(status=discord.Status.do_not_disturb)
+            except Exception:
+                pass
             traceback.print_exc()
 
     async def resolve_source(self, query: str) -> Optional[str]:

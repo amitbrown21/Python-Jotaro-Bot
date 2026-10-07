@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 
 import discord
@@ -8,6 +9,9 @@ from admin_cog import admin_cog
 from config import TOKEN, guild_ids
 from dnd_cog import dnd_cog
 from music_cog import music_cog
+
+# Override via BUILD_ID / GIT_COMMIT env so TrueNAS logs prove which image is running.
+MUSIC_BUILD = os.environ.get("BUILD_ID") or os.environ.get("GIT_COMMIT") or "2026-10-08-skip-fix"
 
 intents = discord.Intents.default()
 intents.voice_states = True
@@ -21,6 +25,7 @@ if sys.platform == 'win32':
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user.name} ({client.user.id})")
+    print(f"MUSIC_BUILD={MUSIC_BUILD}")
     await client.change_presence(status=discord.Status.do_not_disturb)
 
     for name, cog in (
