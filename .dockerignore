@@ -1,52 +1,26 @@
-# Git
 .git
+.github
 .gitignore
-
-# IDE
 .idea
 .vscode
-*.swp
-*.swo
-
-# Python cache
 __pycache__
 *.py[cod]
-*$py.class
-*.pyo
-.Python
 *.egg-info
-
-# Environment
 .env
-.env.local
+.env.*
+!.env.example
 .venv
 venv
-env
-
-# Large binary files (FFmpeg is installed in container)
 ffmpeg.exe
-ffmpeg
-
-# Audio files (test files, not needed in production)
 *.mp3
 *.wav
-*.ogg
-*.m4a
-*.webm
-
-# Temp files
-temp.py
-musictemp.py
+*.webp
 *.spec
-
-# Build artifacts
 build
 dist
-
-# Docker
-Dockerfile
-docker-compose.yml
-.dockerignore
-
-# Cache
 .yt_cache
+docs
+test_offline.py
+README.md
+docker-compose*.yml
+.dockerignore

@@ -1,0 +1,13 @@
+# Paste into TrueNAS: Apps > Discover > Install via YAML
+# Dataset needs only .env (DISCORD_TOKEN, GUILD_IDS)
+# After first GHCR publish: set the package visibility to Public
+#   (github.com/amitbrown21/Python-Jotaro-Bot > Packages)
+
+services:
+  jotaro-bot:
+    image: ghcr.io/amitbrown21/python-jotaro-bot:latest
+    hostname: discord-bot
+    container_name: jotaro-bot
+    restart: unless-stopped
+    volumes:
+      - /mnt/TruMedia/discord-bot:/config:ro
