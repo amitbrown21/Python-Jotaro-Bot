@@ -224,6 +224,7 @@ class music_cog(commands.Cog):
             'noplaylist': False,
             'quiet': True,
             'no_warnings': True,
+            'ignoreerrors': True,  # bad ytsearch entries -> None, not DownloadError
             'extractor_retries': 3,
             'socket_timeout': 15,
             'retries': 3,
@@ -238,6 +239,8 @@ class music_cog(commands.Cog):
         self.ytdl = yt_dlp.YoutubeDL(self.yt_dl_opts)
         self._search_cache: Dict[str, str] = {}
         self._cache_max_size = 100
+        # ponytail: per-guild lock; split locks if cross-guild contention matters
+        self._guild_locks: Dict[int, asyncio.Lock] = {}
 
     def _load_volumes(self) -> Dict[int, int]:
         path = volumes_path()
@@ -271,6 +274,11 @@ class music_cog(commands.Cog):
         if guild_id not in self.queues:
             self.queues[guild_id] = GuildQueue()
         return self.queues[guild_id]
+
+    def get_guild_lock(self, guild_id: int) -> asyncio.Lock:
+        if guild_id not in self._guild_locks:
+            self._guild_locks[guild_id] = asyncio.Lock()
+        return self._guild_locks[guild_id]
 
     def song_embed(
         self,
@@ -387,23 +395,26 @@ class music_cog(commands.Cog):
 
     async def play_next(self, interaction: discord.Interaction):
         try:
-            queue = self.get_queue(interaction.guild_id)
-            voice = interaction.guild.voice_client if interaction.guild else None
+            song = None
+            lock = self.get_guild_lock(interaction.guild_id)
+            async with lock:
+                queue = self.get_queue(interaction.guild_id)
+                voice = interaction.guild.voice_client if interaction.guild else None
+                if not voice:
+                    return
 
-            if not voice:
-                return
+                song = queue.pop_next()
+                if song:
+                    try:
+                        await self.client.change_presence(
+                            activity=discord.Game(name=song.title)
+                        )
+                    except Exception as e:
+                        print(f"play_next presence failed: {e}")
+                    # Play first so expired interaction tokens cannot leave the bot silent.
+                    self.play_audio(voice, song, interaction)
 
-            song = queue.pop_next()
             if song:
-                try:
-                    await self.client.change_presence(
-                        activity=discord.Game(name=song.title)
-                    )
-                except Exception as e:
-                    print(f"play_next presence failed: {e}")
-
-                # Play first so expired interaction tokens cannot leave the bot silent.
-                self.play_audio(voice, song, interaction)
                 await self._announce(
                     interaction,
                     embed=self.song_embed(song, interaction, "Now Playing..."),
@@ -436,14 +447,22 @@ class music_cog(commands.Cog):
         if cache_key in self._search_cache:
             return self._search_cache[cache_key]
 
-        info = await asyncio.to_thread(
-            self.ytdl.extract_info, f"ytsearch1:{query}", False
-        )
-        entries = (info or {}).get("entries") or []
-        if not entries:
+        try:
+            info = await asyncio.to_thread(
+                self.ytdl.extract_info, f"ytsearch1:{query}", False
+            )
+        except yt_dlp.utils.DownloadError as e:
+            print(f"resolve_source DownloadError: {e}")
+            return None
+        except Exception as e:
+            print(f"resolve_source failed: {e}")
             return None
 
-        entry = entries[0]
+        entries = (info or {}).get("entries") or []
+        entry = next((e for e in entries if e), None)
+        if not entry:
+            return None
+
         source = entry.get("webpage_url") or entry.get("url")
         if not source:
             return None
@@ -473,90 +492,131 @@ class music_cog(commands.Cog):
     @app_commands.command(name="play", description="Play a song using YouTube search or URL")
     async def play(self, interaction: discord.Interaction, query: str):
         await interaction.response.defer()
-
-        if not interaction.user.voice:
-            await interaction.followup.send(
-                "Get in a voice channel first, Teme.", ephemeral=True
-            )
-            return
-
-        channel = interaction.user.voice.channel
-        voice = discord.utils.get(self.client.voice_clients, guild=interaction.guild)
-
-        if not voice or not voice.is_connected():
-            voice = await channel.connect()
-
-        queue = self.get_queue(interaction.guild_id)
-
-        source = await self.resolve_source(query)
-        if not source:
-            await interaction.followup.send("No search results, Yare Yare...")
-            return
-
+        responded = False
         try:
-            info = await asyncio.to_thread(self.ytdl.extract_info, source, False)
-        except Exception as e:
-            await interaction.followup.send(f"Error extracting info: {e}")
-            return
-
-        if info.get('_type') == 'playlist':
-            playlist_name = info.get('title', 'Playlist')
-            entries = info.get('entries', [])
-
-            if not entries:
-                await interaction.followup.send("Playlist is empty, Teme.")
+            if not interaction.user.voice:
+                await interaction.followup.send(
+                    "Get in a voice channel first, Teme.", ephemeral=True
+                )
+                responded = True
                 return
 
-            first_song = entries[0]
-            thumbnail = first_song.get('thumbnail', '')
+            channel = interaction.user.voice.channel
 
-            embed = discord.Embed(
-                title=playlist_name,
-                url=info.get('webpage_url', ''),
-                description=f"Adding {len(entries)} songs to queue...",
-                color=0xffff00,
-            )
-            embed.set_author(
-                name=interaction.user.display_name,
-                icon_url=interaction.user.avatar.url if interaction.user.avatar else None,
-            )
-            if thumbnail:
-                embed.set_thumbnail(url=thumbnail)
-            embed.set_footer(text=f'Playlist length: {len(entries)}')
-            await interaction.followup.send(embed=embed)
+            # yt-dlp outside lock so concurrent /plays can search in parallel
+            source = await self.resolve_source(query)
+            if not source:
+                await interaction.followup.send("Can't play that, Teme.")
+                responded = True
+                return
 
-            for entry in entries:
-                song = self.create_song_info(
-                    entry, entry.get('webpage_url', ''), interaction.user
+            try:
+                info = await asyncio.to_thread(self.ytdl.extract_info, source, False)
+            except yt_dlp.utils.DownloadError as e:
+                print(f"play DownloadError: {e}")
+                await interaction.followup.send("Can't play that, Teme.")
+                responded = True
+                return
+            except Exception as e:
+                print(f"play extract_info failed: {e}")
+                await interaction.followup.send("Can't play that, Teme.")
+                responded = True
+                return
+
+            if not info:
+                await interaction.followup.send("Can't play that, Teme.")
+                responded = True
+                return
+
+            lock = self.get_guild_lock(interaction.guild_id)
+            async with lock:
+                voice = discord.utils.get(
+                    self.client.voice_clients, guild=interaction.guild
                 )
-                queue.add(song)
+                if not voice or not voice.is_connected():
+                    voice = await channel.connect()
 
-            if not voice.is_playing() and not voice.is_paused():
-                song = queue.pop_next()
-                if song:
-                    await self.client.change_presence(
-                        activity=discord.Game(name=song.title)
+                queue = self.get_queue(interaction.guild_id)
+
+                if info.get('_type') == 'playlist':
+                    playlist_name = info.get('title', 'Playlist')
+                    entries = [e for e in (info.get('entries') or []) if e]
+
+                    if not entries:
+                        await interaction.followup.send("Playlist is empty, Teme.")
+                        responded = True
+                        return
+
+                    first_song = entries[0]
+                    thumbnail = first_song.get('thumbnail', '')
+
+                    embed = discord.Embed(
+                        title=playlist_name,
+                        url=info.get('webpage_url', ''),
+                        description=f"Adding {len(entries)} songs to queue...",
+                        color=0xffff00,
                     )
-                    self.play_audio(voice, song, interaction)
-        else:
-            song = self.create_song_info(info, source, interaction.user)
-
-            if not voice.is_playing() and not voice.is_paused():
-                queue.current = song
-                await interaction.followup.send(
-                    embed=self.song_embed(song, interaction, "Now Playing...")
-                )
-                await self.client.change_presence(
-                    activity=discord.Game(name=song.title)
-                )
-                self.play_audio(voice, song, interaction)
-            else:
-                position = queue.add(song)
-                await interaction.followup.send(
-                    embed=self.song_embed(
-                        song, interaction, f"Added to queue (Position: {position})"
+                    embed.set_author(
+                        name=interaction.user.display_name,
+                        icon_url=(
+                            interaction.user.avatar.url
+                            if interaction.user.avatar
+                            else None
+                        ),
                     )
-                )
+                    if thumbnail:
+                        embed.set_thumbnail(url=thumbnail)
+                    embed.set_footer(text=f'Playlist length: {len(entries)}')
+                    await interaction.followup.send(embed=embed)
+                    responded = True
+
+                    for entry in entries:
+                        song = self.create_song_info(
+                            entry, entry.get('webpage_url', ''), interaction.user
+                        )
+                        queue.add(song)
+
+                    if not voice.is_playing() and not voice.is_paused():
+                        song = queue.pop_next()
+                        if song:
+                            await self.client.change_presence(
+                                activity=discord.Game(name=song.title)
+                            )
+                            self.play_audio(voice, song, interaction)
+                else:
+                    song = self.create_song_info(info, source, interaction.user)
+
+                    if not voice.is_playing() and not voice.is_paused():
+                        queue.current = song
+                        await interaction.followup.send(
+                            embed=self.song_embed(
+                                song, interaction, "Now Playing..."
+                            )
+                        )
+                        responded = True
+                        await self.client.change_presence(
+                            activity=discord.Game(name=song.title)
+                        )
+                        self.play_audio(voice, song, interaction)
+                    else:
+                        position = queue.add(song)
+                        await interaction.followup.send(
+                            embed=self.song_embed(
+                                song,
+                                interaction,
+                                f"Added to queue (Position: {position})",
+                            )
+                        )
+                        responded = True
+        except Exception as e:
+            print(f"play failed: {e}")
+            traceback.print_exc()
+        finally:
+            if not responded:
+                try:
+                    await interaction.followup.send("Can't play that, Teme.")
+                except Exception:
+                    pass
 
     @app_commands.command(name="leave", description="Make Jotaro leave the voice channel")
     async def leave(self, interaction: discord.Interaction):
