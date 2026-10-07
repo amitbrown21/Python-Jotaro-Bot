@@ -6,7 +6,7 @@ JoJo-themed Discord bot: music (yt-dlp), D&D helpers, slash commands only.
 
 ## Features
 
-- Music: `/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/clear_queue` `/remove_last` `/leave` `/localplay`
+- Music: `/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/shuffle` `/loop` `/clear_queue` `/remove_last` `/leave` `/localplay`
 - D&D: `/roll` `/generate_stats` `/initiative` `/generate_character` `/loot` `/weather` `/coinflip`
 - Other: `/ping` `/hello` `/sync`
 
@@ -32,7 +32,16 @@ docker compose logs -f
 1. Push this repo to `main` (GitHub Action publishes the image).
 2. On GitHub: Packages → `python-jotaro-bot` → Package settings → change visibility to **Public** (or add GHCR credentials in TrueNAS).
 3. Put only a `.env` on dataset `/mnt/TruMedia/discord-bot`.
-4. Apps → Discover → Custom App **or** Install via YAML.
+4. Fix ownership so the container user can read it (runs as **UID 1000**):
+
+```bash
+chown -R 1000:1000 /mnt/TruMedia/discord-bot
+chmod 755 /mnt/TruMedia/discord-bot
+chmod 644 /mnt/TruMedia/discord-bot/.env
+```
+
+Or in the Custom App wizard set **Custom User** / group to `1000`.
+5. Apps → Discover → Custom App **or** Install via YAML.
 
 **Custom App wizard**
 
@@ -43,8 +52,11 @@ docker compose logs -f
 | Tag | `latest` |
 | Hostname | `discord-bot` |
 | Storage | Host `/mnt/TruMedia/discord-bot` → Container `/config` |
+| Custom User (optional) | `1000` |
 
 No ports. Needs outbound internet.
+
+If you see `Permission denied: '/config/.env'`, re-run the `chown`/`chmod` steps above (or set Custom User to 1000).
 
 **YAML:** paste `docker-compose.truenas.yml`.
 

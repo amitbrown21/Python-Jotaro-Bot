@@ -5,10 +5,22 @@ from dotenv import load_dotenv
 
 # Docker/TrueNAS: mount host config dir to /config
 # Local: fall back to .env in the project folder
-if Path('/config/.env').is_file():
-    load_dotenv('/config/.env')
-else:
-    load_dotenv()
+_CONFIG_ENV = Path('/config/.env')
+_TRUENAS_PERM_HINT = (
+    "Permission denied reading /config/.env (TrueNAS). "
+    "On the host run: chown -R 1000:1000 /mnt/TruMedia/discord-bot && "
+    "chmod 755 /mnt/TruMedia/discord-bot && chmod 644 /mnt/TruMedia/discord-bot/.env "
+    "(container UID 1000), or set Custom User to 1000."
+)
+try:
+    if _CONFIG_ENV.is_file():
+        load_dotenv(_CONFIG_ENV)
+    else:
+        load_dotenv()
+except PermissionError as e:
+    # Host mount root-owned/mode 700 — botuser cannot stat/read .env
+    if not os.getenv('DISCORD_TOKEN'):
+        raise ValueError(_TRUENAS_PERM_HINT) from e
 
 TOKEN = os.getenv('DISCORD_TOKEN', '')
 if not TOKEN:

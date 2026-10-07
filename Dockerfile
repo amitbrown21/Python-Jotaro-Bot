@@ -10,7 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libopus0 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --create-home --shell /bin/bash botuser
+# Explicit UID so TrueNAS host mounts can chown 1000:1000
+RUN useradd -u 1000 --create-home --shell /bin/bash botuser
 WORKDIR /app
 
 COPY requirements.txt .

@@ -1,5 +1,8 @@
 # Paste into TrueNAS: Apps > Discover > Install via YAML
 # Dataset needs only .env (DISCORD_TOKEN, GUILD_IDS)
+# Host path must be readable by UID 1000 (botuser):
+#   chown -R 1000:1000 /mnt/TruMedia/discord-bot
+#   chmod 755 /mnt/TruMedia/discord-bot && chmod 644 /mnt/TruMedia/discord-bot/.env
 # After first GHCR publish: set the package visibility to Public
 #   (github.com/amitbrown21/Python-Jotaro-Bot > Packages)
 

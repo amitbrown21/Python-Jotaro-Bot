@@ -1,5 +1,7 @@
 import asyncio
+import json
 import os
+import random
 import traceback
 from typing import Dict, Optional
 
@@ -9,15 +11,30 @@ from discord import app_commands, FFmpegPCMAudio
 from discord.ext import commands
 
 
+def volumes_path() -> str:
+    return "/config/volumes.json" if os.path.isdir("/config") else "./volumes.json"
+
+
 class SongInfo:
     """Represents a song in the queue with lazy audio loading."""
 
-    def __init__(self, title: str, url: str, audio_url: str, thumbnail: str, ffmpeg_options: dict):
+    def __init__(
+        self,
+        title: str,
+        url: str,
+        audio_url: str,
+        thumbnail: str,
+        ffmpeg_options: dict,
+        requester_id: Optional[int] = None,
+        requester_name: Optional[str] = None,
+    ):
         self.title = title
         self.url = url
         self.audio_url = audio_url
         self.thumbnail = thumbnail
         self.ffmpeg_options = ffmpeg_options
+        self.requester_id = requester_id
+        self.requester_name = requester_name
         self._audio: Optional[FFmpegPCMAudio] = None
 
     @property
@@ -32,15 +49,24 @@ class GuildQueue:
 
     def __init__(self):
         self.songs: list[SongInfo] = []
+        self.history: list[SongInfo] = []
         self.current: Optional[SongInfo] = None
         self.skipping = False
         self.stopping = False
+        self.looping = False
 
     def add(self, song: SongInfo) -> int:
         self.songs.append(song)
         return len(self.songs)
 
     def pop_next(self) -> Optional[SongInfo]:
+        if self.looping and self.current is not None:
+            self.history.append(self.current)
+
+        if not self.songs and self.looping and self.history:
+            self.songs = self.history
+            self.history = []
+
         if self.songs:
             self.current = self.songs.pop(0)
             return self.current
@@ -49,12 +75,40 @@ class GuildQueue:
 
     def clear(self):
         self.songs.clear()
+        self.history.clear()
         self.current = None
 
     def remove_last(self) -> Optional[SongInfo]:
         if self.songs:
             return self.songs.pop()
         return None
+
+    def move_up(self, index: int) -> bool:
+        """1-based pending index. Swap with previous."""
+        i = index - 1
+        if i <= 0 or i >= len(self.songs):
+            return False
+        self.songs[i - 1], self.songs[i] = self.songs[i], self.songs[i - 1]
+        return True
+
+    def move_down(self, index: int) -> bool:
+        """1-based pending index. Swap with next."""
+        i = index - 1
+        if i < 0 or i >= len(self.songs) - 1:
+            return False
+        self.songs[i], self.songs[i + 1] = self.songs[i + 1], self.songs[i]
+        return True
+
+    def move_to_front(self, index: int) -> bool:
+        """1-based pending index. Move song to position 1."""
+        i = index - 1
+        if i <= 0 or i >= len(self.songs):
+            return False
+        self.songs.insert(0, self.songs.pop(i))
+        return True
+
+    def shuffle(self):
+        random.shuffle(self.songs)
 
     def __len__(self) -> int:
         return len(self.songs)
@@ -63,11 +117,106 @@ class GuildQueue:
         return bool(self.songs)
 
 
+class QueueControlView(discord.ui.View):
+    """Select a pending song, then move it up / down / to front."""
+
+    def __init__(self, cog: "music_cog", guild_id: int):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.selected = 1
+        self._rebuild_select()
+
+    def _rebuild_select(self):
+        for item in list(self.children):
+            if isinstance(item, discord.ui.Select):
+                self.remove_item(item)
+
+        queue = self.cog.get_queue(self.guild_id)
+        options = [
+            discord.SelectOption(
+                label=f"{i}. {song.title}"[:100],
+                value=str(i),
+                description=(song.requester_name or "unknown")[:100],
+            )
+            for i, song in enumerate(queue.songs[:25], start=1)
+        ]
+        if not options:
+            return
+
+        select = discord.ui.Select(
+            placeholder="Pick a song to move...",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
+
+        async def on_select(interaction: discord.Interaction):
+            if err := self.cog.same_vc_error(interaction):
+                await interaction.response.send_message(err, ephemeral=True)
+                return
+            self.selected = int(select.values[0])
+            await interaction.response.defer()
+
+        select.callback = on_select
+        self.add_item(select)
+
+    async def _move(self, interaction: discord.Interaction, action: str):
+        if err := self.cog.same_vc_error(interaction):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+
+        queue = self.cog.get_queue(self.guild_id)
+        if action == "up":
+            ok = queue.move_up(self.selected)
+            if ok and self.selected > 1:
+                self.selected -= 1
+        elif action == "down":
+            ok = queue.move_down(self.selected)
+            if ok:
+                self.selected += 1
+        else:
+            ok = queue.move_to_front(self.selected)
+            if ok:
+                self.selected = 1
+
+        if not ok:
+            await interaction.response.send_message(
+                "Can't move that, Teme.", ephemeral=True
+            )
+            return
+
+        self._rebuild_select()
+        embed = self.cog.build_queue_embed(queue)
+        await interaction.response.edit_message(
+            embed=embed, view=self if queue.songs else None
+        )
+
+    @discord.ui.button(label="Move up", style=discord.ButtonStyle.secondary)
+    async def move_up_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await self._move(interaction, "up")
+
+    @discord.ui.button(label="Move down", style=discord.ButtonStyle.secondary)
+    async def move_down_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await self._move(interaction, "down")
+
+    @discord.ui.button(label="To front", style=discord.ButtonStyle.primary)
+    async def to_front_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await self._move(interaction, "front")
+
+
 class music_cog(commands.Cog):
 
     def __init__(self, client: commands.Bot):
         self.client = client
         self.queues: Dict[int, GuildQueue] = {}
+        self.volumes: Dict[int, int] = self._load_volumes()
 
         self.yt_dl_opts = {
             'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
@@ -89,6 +238,34 @@ class music_cog(commands.Cog):
         self.ytdl = yt_dlp.YoutubeDL(self.yt_dl_opts)
         self._search_cache: Dict[str, str] = {}
         self._cache_max_size = 100
+
+    def _load_volumes(self) -> Dict[int, int]:
+        path = volumes_path()
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            return {int(k): int(v) for k, v in data.items()}
+        except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
+            return {}
+
+    def _save_volumes(self):
+        path = volumes_path()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in self.volumes.items()}, f)
+
+    def get_volume_percent(self, channel_id: int) -> int:
+        return self.volumes.get(channel_id, 100)
+
+    def same_vc_error(self, interaction: discord.Interaction) -> Optional[str]:
+        voice = interaction.guild.voice_client if interaction.guild else None
+        if not voice or not voice.channel:
+            return "I'm not in a voice channel, Teme."
+        if (
+            not interaction.user.voice
+            or interaction.user.voice.channel != voice.channel
+        ):
+            return "Get in my voice channel first, Teme."
+        return None
 
     def get_queue(self, guild_id: int) -> GuildQueue:
         if guild_id not in self.queues:
@@ -115,23 +292,59 @@ class music_cog(commands.Cog):
             embed.set_thumbnail(url=song.thumbnail)
         return embed
 
-    async def print_queue(self, interaction: discord.Interaction):
-        queue = self.get_queue(interaction.guild_id)
-        if queue:
-            queue_info = "\n".join(
-                f"{index}. [{song.title}]({song.url})"
-                for index, song in enumerate(queue.songs, start=1)
+    def build_queue_embed(self, queue: GuildQueue) -> discord.Embed:
+        lines = []
+        if queue.current:
+            req = queue.current.requester_name or "unknown"
+            lines.append(
+                f"**Now playing:** [{queue.current.title}]({queue.current.url}) — {req}"
             )
-            embed = discord.Embed(
-                title="Current Queue",
-                description=queue_info,
-                color=0x3498db,
-            )
-            await interaction.response.send_message(embed=embed)
+            lines.append("")
+        if queue.songs:
+            lines.append("**Up next:**")
+            for i, song in enumerate(queue.songs, start=1):
+                req = song.requester_name or "unknown"
+                lines.append(f"{i}. [{song.title}]({song.url}) — {req}")
+        elif not queue.current:
+            lines.append("Queue is empty.")
         else:
+            lines.append("*Nothing waiting.*")
+
+        if queue.looping:
+            lines.append("")
+            lines.append("🔁 Queue loop ON")
+
+        return discord.Embed(
+            title="Current Queue",
+            description="\n".join(lines),
+            color=0x3498db,
+        )
+
+    def play_audio(
+        self,
+        voice: discord.VoiceClient,
+        song: SongInfo,
+        interaction: discord.Interaction,
+    ):
+        vol = self.get_volume_percent(voice.channel.id) / 100.0
+        source = discord.PCMVolumeTransformer(song.audio, volume=vol)
+        voice.play(source, after=lambda x=None: self.after_play(interaction))
+
+    async def print_queue(self, interaction: discord.Interaction):
+        if err := self.same_vc_error(interaction):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+
+        queue = self.get_queue(interaction.guild_id)
+        if not queue.current and not queue.songs:
             await interaction.response.send_message(
                 "Queue is empty, Teme.", ephemeral=True
             )
+            return
+
+        embed = self.build_queue_embed(queue)
+        view = QueueControlView(self, interaction.guild_id) if queue.songs else None
+        await interaction.response.send_message(embed=embed, view=view)
 
     def find_general_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
         for channel in guild.text_channels:
@@ -140,15 +353,19 @@ class music_cog(commands.Cog):
         return None
 
     def after_play(self, interaction: discord.Interaction):
+        # stopping: queue cleared — do not advance.
+        # skipping or natural end: clear skip flag, then play_next.
         queue = self.get_queue(interaction.guild_id)
-        if not queue.skipping and not queue.stopping:
-            asyncio.run_coroutine_threadsafe(
-                self.play_next(interaction),
-                self.client.loop,
-            )
-        else:
+        if queue.stopping:
             queue.stopping = False
             queue.skipping = False
+            return
+        if queue.skipping:
+            queue.skipping = False
+        asyncio.run_coroutine_threadsafe(
+            self.play_next(interaction),
+            self.client.loop,
+        )
 
     async def play_next(self, interaction: discord.Interaction):
         try:
@@ -166,10 +383,7 @@ class music_cog(commands.Cog):
                 await interaction.followup.send(
                     embed=self.song_embed(song, interaction, "Now Playing...")
                 )
-                voice.play(
-                    song.audio,
-                    after=lambda x=None: self.after_play(interaction),
-                )
+                self.play_audio(voice, song, interaction)
             else:
                 await self.client.change_presence(status=discord.Status.do_not_disturb)
                 await interaction.followup.send("Owari Da... no more songs in the queue")
@@ -206,13 +420,20 @@ class music_cog(commands.Cog):
         self._search_cache[cache_key] = source
         return source
 
-    def create_song_info(self, info: dict, webpage_url: str = None) -> SongInfo:
+    def create_song_info(
+        self,
+        info: dict,
+        webpage_url: str = None,
+        requester: discord.abc.User = None,
+    ) -> SongInfo:
         return SongInfo(
             title=info.get('title', 'Unknown'),
             url=webpage_url or info.get('webpage_url', ''),
             audio_url=info.get('url', ''),
             thumbnail=info.get('thumbnail', ''),
             ffmpeg_options=self.ffmpeg_options,
+            requester_id=requester.id if requester else None,
+            requester_name=requester.display_name if requester else None,
         )
 
     @app_commands.command(name="play", description="Play a song using YouTube search or URL")
@@ -271,7 +492,9 @@ class music_cog(commands.Cog):
             await interaction.followup.send(embed=embed)
 
             for entry in entries:
-                song = self.create_song_info(entry, entry.get('webpage_url', ''))
+                song = self.create_song_info(
+                    entry, entry.get('webpage_url', ''), interaction.user
+                )
                 queue.add(song)
 
             if not voice.is_playing() and not voice.is_paused():
@@ -280,24 +503,19 @@ class music_cog(commands.Cog):
                     await self.client.change_presence(
                         activity=discord.Game(name=song.title)
                     )
-                    voice.play(
-                        song.audio,
-                        after=lambda x=None: self.after_play(interaction),
-                    )
+                    self.play_audio(voice, song, interaction)
         else:
-            song = self.create_song_info(info, source)
+            song = self.create_song_info(info, source, interaction.user)
 
             if not voice.is_playing() and not voice.is_paused():
+                queue.current = song
                 await interaction.followup.send(
                     embed=self.song_embed(song, interaction, "Now Playing...")
                 )
                 await self.client.change_presence(
                     activity=discord.Game(name=song.title)
                 )
-                voice.play(
-                    song.audio,
-                    after=lambda x=None: self.after_play(interaction),
-                )
+                self.play_audio(voice, song, interaction)
             else:
                 position = queue.add(song)
                 await interaction.followup.send(
@@ -373,6 +591,88 @@ class music_cog(commands.Cog):
     async def queue(self, interaction: discord.Interaction):
         await self.print_queue(interaction)
 
+    @app_commands.command(name="nowplaying", description="Show the currently playing song")
+    async def nowplaying(self, interaction: discord.Interaction):
+        if err := self.same_vc_error(interaction):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+
+        queue = self.get_queue(interaction.guild_id)
+        song = queue.current
+        if not song:
+            await interaction.response.send_message(
+                "Nothing playing, Teme.", ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(
+            title=song.title,
+            url=song.url,
+            description=f"Requested by {song.requester_name or 'unknown'}",
+            color=0xffff00,
+        )
+        if song.thumbnail:
+            embed.set_thumbnail(url=song.thumbnail)
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="volume", description="Show or set volume (0-100) for this voice channel")
+    @app_commands.describe(level="Volume 0-100; omit to show current")
+    async def volume(
+        self, interaction: discord.Interaction, level: Optional[app_commands.Range[int, 0, 100]] = None
+    ):
+        if err := self.same_vc_error(interaction):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+
+        channel_id = interaction.guild.voice_client.channel.id
+        if level is None:
+            current = self.get_volume_percent(channel_id)
+            await interaction.response.send_message(f"Volume is {current}%, Teme.")
+            return
+
+        self.volumes[channel_id] = int(level)
+        self._save_volumes()
+
+        voice = interaction.guild.voice_client
+        if voice and voice.source and hasattr(voice.source, "volume"):
+            voice.source.volume = int(level) / 100.0
+
+        await interaction.response.send_message(
+            f"Volume set to {int(level)}%, Yare Yare..."
+        )
+
+    @app_commands.command(name="shuffle", description="Shuffle the pending queue")
+    async def shuffle(self, interaction: discord.Interaction):
+        if err := self.same_vc_error(interaction):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+
+        queue = self.get_queue(interaction.guild_id)
+        if not queue.songs:
+            await interaction.response.send_message(
+                "Nothing to shuffle, Teme.", ephemeral=True
+            )
+            return
+
+        queue.shuffle()
+        await interaction.response.send_message("Shuffled the queue, Yare Yare...")
+
+    @app_commands.command(name="loop", description="Toggle queue loop")
+    async def loop(self, interaction: discord.Interaction):
+        if err := self.same_vc_error(interaction):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+
+        queue = self.get_queue(interaction.guild_id)
+        queue.looping = not queue.looping
+        if queue.looping:
+            await interaction.response.send_message(
+                "Queue loop ON. Round and round, Yare Yare..."
+            )
+        else:
+            queue.history.clear()
+            await interaction.response.send_message("Queue loop OFF. Owari da.")
+
     @app_commands.command(name="clear_queue", description="Clear the current queue")
     async def clear_queue(self, interaction: discord.Interaction):
         queue = self.get_queue(interaction.guild_id)
@@ -438,8 +738,12 @@ class music_cog(commands.Cog):
             return
 
         try:
+            vol = self.get_volume_percent(voice.channel.id) / 100.0
+            source = discord.PCMVolumeTransformer(
+                FFmpegPCMAudio(song_path), volume=vol
+            )
             voice.play(
-                FFmpegPCMAudio(song_path),
+                source,
                 after=lambda x=None: self.after_play(interaction),
             )
             await interaction.followup.send(f"Now playing: {filename}")
