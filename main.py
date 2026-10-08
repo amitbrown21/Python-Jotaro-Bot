@@ -11,7 +11,7 @@ from dnd_cog import dnd_cog
 from music_cog import music_cog
 
 # Override via BUILD_ID / GIT_COMMIT env so TrueNAS logs prove which image is running.
-MUSIC_BUILD = os.environ.get("BUILD_ID") or os.environ.get("GIT_COMMIT") or "2026-10-08-play-concurrent"
+MUSIC_BUILD = os.environ.get("BUILD_ID") or os.environ.get("GIT_COMMIT") or "2026-10-08-buf-1m"
 
 intents = discord.Intents.default()
 intents.voice_states = True

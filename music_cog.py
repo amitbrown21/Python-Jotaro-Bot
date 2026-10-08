@@ -233,7 +233,7 @@ class music_cog(commands.Cog):
 
         self.ffmpeg_options = {
             'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-            'options': '-vn -bufsize 64k',
+            'options': '-vn -bufsize 1M',
         }
 
         self.ytdl = yt_dlp.YoutubeDL(self.yt_dl_opts)
