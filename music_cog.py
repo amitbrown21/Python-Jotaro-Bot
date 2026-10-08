@@ -2,13 +2,57 @@ import asyncio
 import json
 import os
 import random
+import re
+import subprocess
+import time
 import traceback
 from typing import Dict, Optional
 
 import discord
 import yt_dlp
-from discord import app_commands, FFmpegPCMAudio
+from discord import app_commands, FFmpegPCMAudio, PCMVolumeTransformer
 from discord.ext import commands
+
+_EXPIRE_RE = re.compile(r"[?&]expire=(\d+)")
+
+
+def stream_url_stale(url: Optional[str], now: float) -> bool:
+    """Missing, a YouTube page, or a googlevideo URL past expire=."""
+    if not url:
+        return True
+    if "googlevideo.com" in url:
+        match = _EXPIRE_RE.search(url)
+        if not match:
+            return False
+        return int(match.group(1)) <= now
+    return "youtube.com" in url or "youtu.be" in url
+
+
+class TrackAudio(FFmpegPCMAudio):
+    """Surface a non-zero ffmpeg exit. discord.py checks too early if the process has not reaped."""
+
+    def read(self) -> bytes:
+        data = super().read()
+        if data or self._current_error is not None:
+            return data
+        proc = getattr(self, "_process", None)
+        if proc is None or not hasattr(proc, "wait"):
+            return data
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                return data
+            self._check_process_returncode()
+        return data
+
+
+class VolumeAudio(PCMVolumeTransformer):
+    """Player reads _current_error on the wrapper; ffmpeg sets it on the inner source."""
+
+    @property
+    def _current_error(self):
+        return getattr(self.original, "_current_error", None)
 
 
 def volumes_path() -> str:
@@ -35,12 +79,14 @@ class SongInfo:
         self.ffmpeg_options = ffmpeg_options
         self.requester_id = requester_id
         self.requester_name = requester_name
+        self.playback_retried = False
+        self._preload: Optional[asyncio.Task] = None
         self._audio: Optional[FFmpegPCMAudio] = None
 
     @property
     def audio(self) -> FFmpegPCMAudio:
         if self._audio is None:
-            self._audio = FFmpegPCMAudio(self.audio_url, **self.ffmpeg_options)
+            self._audio = TrackAudio(self.audio_url, **self.ffmpeg_options)
         return self._audio
 
 
@@ -186,6 +232,7 @@ class QueueControlView(discord.ui.View):
             )
             return
 
+        self.cog.schedule_preload(self.guild_id)
         self._rebuild_select()
         embed = self.cog.build_queue_embed(queue)
         await interaction.response.edit_message(
@@ -241,6 +288,7 @@ class music_cog(commands.Cog):
         self._cache_max_size = 100
         # ponytail: per-guild lock; split locks if cross-guild contention matters
         self._guild_locks: Dict[int, asyncio.Lock] = {}
+        self._extract_lock = asyncio.Lock()
 
     def _load_volumes(self) -> Dict[int, int]:
         path = volumes_path()
@@ -337,8 +385,11 @@ class music_cog(commands.Cog):
         # FFmpegPCMAudio cannot be replayed after stop; always build a fresh source.
         song._audio = None
         vol = self.get_volume_percent(voice.channel.id) / 100.0
-        source = discord.PCMVolumeTransformer(song.audio, volume=vol)
-        voice.play(source, after=lambda x=None: self.after_play(interaction))
+        source = VolumeAudio(song.audio, volume=vol)
+        voice.play(
+            source,
+            after=lambda error, s=song: self.after_play(interaction, error, s),
+        )
 
     async def print_queue(self, interaction: discord.Interaction):
         if err := self.same_vc_error(interaction):
@@ -378,13 +429,34 @@ class music_cog(commands.Cog):
             except Exception as e:
                 print(f"announce channel send failed: {e}")
 
-    def after_play(self, interaction: discord.Interaction):
+    def after_play(
+        self,
+        interaction: discord.Interaction,
+        error: Optional[BaseException] = None,
+        song: Optional[SongInfo] = None,
+    ):
         # stopping: queue cleared — do not advance.
+        # ffmpeg error: refresh this song once from song.url, then advance.
         # skipping or natural end: clear skip flag, then play_next.
         queue = self.get_queue(interaction.guild_id)
+        if error:
+            print(f"playback error: {error}")
         if queue.stopping:
             queue.stopping = False
             queue.skipping = False
+            return
+        if (
+            error
+            and song is not None
+            and song is queue.current
+            and not song.playback_retried
+            and not queue.skipping
+        ):
+            song.playback_retried = True
+            asyncio.run_coroutine_threadsafe(
+                self._retry_playback(interaction, song),
+                self.client.loop,
+            )
             return
         if queue.skipping:
             queue.skipping = False
@@ -393,9 +465,91 @@ class music_cog(commands.Cog):
             self.client.loop,
         )
 
-    async def play_next(self, interaction: discord.Interaction):
+    def schedule_preload(self, guild_id: int):
+        # ponytail: preload only the next song, once; play_next re-extracts if this dies
+        queue = self.get_queue(guild_id)
+        if not queue.songs:
+            return
+        song = queue.songs[0]
+        if not song.url or not stream_url_stale(song.audio_url, time.time()):
+            return
+        if song._preload is not None and not song._preload.done():
+            return
+        song._preload = asyncio.create_task(self._refresh_stream(song))
+
+    async def _extract(self, url: str):
+        async with self._extract_lock:
+            return await asyncio.to_thread(self.ytdl.extract_info, url, False)
+
+    async def _refresh_stream(self, song: SongInfo) -> bool:
+        """Re-extract a direct stream from the stable webpage, never from audio_url."""
+        if not song.url:
+            return False
+        try:
+            info = await self._extract(song.url)
+        except Exception as e:
+            print(f"refresh stream failed: {e}")
+            return False
+        if info and info.get("_type") == "playlist":
+            info = next((e for e in (info.get("entries") or []) if e), None)
+        audio = (info or {}).get("url") or ""
+        if not audio:
+            return False
+        song.audio_url = audio
+        song._audio = None
+        return True
+
+    async def _ensure_stream(self, song: SongInfo):
+        if not stream_url_stale(song.audio_url, time.time()):
+            return
+        if song._preload is not None and not song._preload.done():
+            await song._preload
+        if stream_url_stale(song.audio_url, time.time()):
+            await self._refresh_stream(song)
+
+    async def begin_playback(
+        self,
+        voice: discord.VoiceClient,
+        song: SongInfo,
+        interaction: discord.Interaction,
+    ):
+        song.playback_retried = False
+        await self._ensure_stream(song)
+        try:
+            self.play_audio(voice, song, interaction)
+        except Exception as e:
+            print(f"play_audio failed: {e}")
+            if song.playback_retried:
+                raise
+            song.playback_retried = True
+            await self._refresh_stream(song)
+            self.play_audio(voice, song, interaction)
+        self.schedule_preload(interaction.guild_id)
+
+    async def _retry_playback(self, interaction: discord.Interaction, song: SongInfo):
+        queue = self.get_queue(interaction.guild_id)
+        voice = interaction.guild.voice_client if interaction.guild else None
+        if queue.current is not song or queue.stopping or queue.skipping:
+            return
+        if not voice or not voice.is_connected():
+            await self.play_next(interaction)
+            return
+        if not await self._refresh_stream(song):
+            await self.play_next(interaction)
+            return
+        if queue.current is not song or queue.stopping or queue.skipping:
+            return
+        try:
+            self.play_audio(voice, song, interaction)
+            self.schedule_preload(interaction.guild_id)
+        except Exception as e:
+            print(f"retry playback failed: {e}")
+            await self.play_next(interaction)
+
+    async def play_next(self, interaction: discord.Interaction, failures: int = 0):
         try:
             song = None
+            failed = False
             lock = self.get_guild_lock(interaction.guild_id)
             async with lock:
                 queue = self.get_queue(interaction.guild_id)
@@ -412,7 +566,17 @@ class music_cog(commands.Cog):
                     except Exception as e:
                         print(f"play_next presence failed: {e}")
                     # Play first so expired interaction tokens cannot leave the bot silent.
-                    self.play_audio(voice, song, interaction)
+                    try:
+                        await self.begin_playback(voice, song, interaction)
+                    except Exception as e:
+                        print(f"begin_playback failed: {e}")
+                        failed = True
+
+            if failed:
+                # ponytail: stop after 3 bad URLs so a looping track cannot recurse forever
+                if failures < 2:
+                    await self.play_next(interaction, failures + 1)
+                return
 
             if song:
                 await self._announce(
@@ -448,9 +612,7 @@ class music_cog(commands.Cog):
             return self._search_cache[cache_key]
 
         try:
-            info = await asyncio.to_thread(
-                self.ytdl.extract_info, f"ytsearch1:{query}", False
-            )
+            info = await self._extract(f"ytsearch1:{query}")
         except yt_dlp.utils.DownloadError as e:
             print(f"resolve_source DownloadError: {e}")
             return None
@@ -511,7 +673,7 @@ class music_cog(commands.Cog):
                 return
 
             try:
-                info = await asyncio.to_thread(self.ytdl.extract_info, source, False)
+                info = await self._extract(source)
             except yt_dlp.utils.DownloadError as e:
                 print(f"play DownloadError: {e}")
                 await interaction.followup.send("Can't play that, Teme.")
@@ -582,7 +744,9 @@ class music_cog(commands.Cog):
                             await self.client.change_presence(
                                 activity=discord.Game(name=song.title)
                             )
-                            self.play_audio(voice, song, interaction)
+                            await self.begin_playback(voice, song, interaction)
+                    else:
+                        self.schedule_preload(interaction.guild_id)
                 else:
                     song = self.create_song_info(info, source, interaction.user)
 
@@ -597,9 +761,10 @@ class music_cog(commands.Cog):
                         await self.client.change_presence(
                             activity=discord.Game(name=song.title)
                         )
-                        self.play_audio(voice, song, interaction)
+                        await self.begin_playback(voice, song, interaction)
                     else:
                         position = queue.add(song)
+                        self.schedule_preload(interaction.guild_id)
                         await interaction.followup.send(
                             embed=self.song_embed(
                                 song,
@@ -749,6 +914,7 @@ class music_cog(commands.Cog):
             return
 
         queue.shuffle()
+        self.schedule_preload(interaction.guild_id)
         await interaction.response.send_message("Shuffled the queue, Yare Yare...")
 
     @app_commands.command(name="loop", description="Toggle queue loop")

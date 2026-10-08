@@ -1,6 +1,6 @@
 """Offline self-checks. Run: python test_offline.py"""
 from dnd_cog import roll_dice_expr
-from music_cog import GuildQueue, SongInfo
+from music_cog import GuildQueue, SongInfo, stream_url_stale
 
 
 def test_roll_dice_expr():
@@ -27,6 +27,22 @@ def _song(title: str) -> SongInfo:
         {"before_options": "", "options": ""},
         requester_id=1, requester_name="Jotaro",
     )
+
+
+def test_stream_url_stale():
+    assert stream_url_stale(None, 1000) is True
+    assert stream_url_stale("", 1000) is True
+    assert stream_url_stale("https://cdn.example/a.mp3", 1000) is False
+    fresh = "https://rr.googlevideo.com/videoplayback?expire=2000&id=1"
+    dead = "https://rr.googlevideo.com/videoplayback?foo=1&expire=1000"
+    assert stream_url_stale(fresh, 1000) is False
+    assert stream_url_stale(dead, 1000) is True
+    assert stream_url_stale(dead, 999) is False
+    assert stream_url_stale("https://www.youtube.com/watch?v=abc", 1000) is True
+    assert stream_url_stale("https://youtu.be/abc", 1000) is True
+    assert stream_url_stale(
+        "https://rr.googlevideo.com/videoplayback?id=1", 1000
+    ) is False
 
 
 def test_guild_queue():
@@ -112,6 +128,7 @@ def test_guild_queue_move_shuffle_loop():
 
 if __name__ == "__main__":
     test_roll_dice_expr()
+    test_stream_url_stale()
     test_guild_queue()
     test_guild_queue_move_shuffle_loop()
     print("ok")
