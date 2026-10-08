@@ -1,6 +1,12 @@
 """Offline self-checks. Run: python test_offline.py"""
 from dnd_cog import roll_dice_expr
-from music_cog import GuildQueue, SongInfo, stream_url_stale
+from music_cog import (
+    GuildQueue,
+    SongInfo,
+    build_ffmpeg_options,
+    parse_seek,
+    stream_url_stale,
+)
 
 
 def test_roll_dice_expr():
@@ -126,9 +132,58 @@ def test_guild_queue_move_shuffle_loop():
     assert q.current is None
 
 
+def test_remove_seek_played():
+    q = GuildQueue()
+    a, b, c = _song("A"), _song("B"), _song("C")
+    q.add(a)
+    q.add(b)
+    q.add(c)
+    assert q.remove_at(0) is None
+    assert q.remove_at(4) is None
+    assert q.remove_at(2) is b
+    assert [s.title for s in q.songs] == ["A", "C"]
+    assert q.history == []
+
+    assert parse_seek("90") == 90
+    assert parse_seek("1:30") == 90
+    assert parse_seek("1:02:03") == 3723
+    assert parse_seek("0") == 0
+    assert parse_seek("nope") is None
+    assert parse_seek("1:60") is None
+    assert parse_seek("") is None
+    assert parse_seek("1:2:3:4") is None
+
+    base = {"before_options": "-reconnect 1", "options": "-vn -bufsize 1M"}
+    night = build_ffmpeg_options(base, "nightcore", 90)
+    assert night["before_options"] == "-reconnect 1 -ss 90"
+    assert "asetrate=48000*1.25,aresample=48000" in night["options"]
+    assert "atempo" not in night["options"]
+    assert "bass=g=8" in build_ffmpeg_options(base, "bass")["options"]
+    assert "-af" not in build_ffmpeg_options(base, "off")["options"]
+    assert base == {"before_options": "-reconnect 1", "options": "-vn -bufsize 1M"}
+
+    for title in ["Old", "New"]:
+        q.note_played(_song(title))
+    assert [t for t, _ in q.played] == ["New", "Old"]
+    assert q.history == []
+    song = q.requeue_played(1, {"before_options": "", "options": ""})
+    assert song is not None and song.title == "New"
+    assert q.songs[-1].title == "New"
+    assert q.requeue_played(9, {}) is None
+    for i in range(12):
+        q.note_played(_song(f"S{i}"))
+    assert len(q.played) == 10
+    assert q.played[0][0] == "S11"
+    q.history = [a]
+    q.clear()
+    assert q.history == []
+    assert q.played[0][0] == "S11"
+
+
 if __name__ == "__main__":
     test_roll_dice_expr()
     test_stream_url_stale()
     test_guild_queue()
     test_guild_queue_move_shuffle_loop()
+    test_remove_seek_played()
     print("ok")

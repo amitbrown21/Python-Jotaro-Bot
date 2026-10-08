@@ -6,6 +6,8 @@ import re
 import subprocess
 import time
 import traceback
+import urllib.parse
+import urllib.request
 from typing import Dict, Optional
 
 import discord
@@ -26,6 +28,78 @@ def stream_url_stale(url: Optional[str], now: float) -> bool:
             return False
         return int(match.group(1)) <= now
     return "youtube.com" in url or "youtu.be" in url
+
+
+_EFFECT_AF = {
+    "bass": "bass=g=8",
+    "nightcore": "asetrate=48000*1.25,aresample=48000",
+}
+
+
+def parse_seek(text: str) -> Optional[int]:
+    """`90`, `1:30`, or `1:02:03` → seconds. None if it isn't a time."""
+    parts = (text or "").strip().split(":")
+    if not parts or len(parts) > 3:
+        return None
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return None
+    if any(n < 0 for n in nums) or any(n >= 60 for n in nums[1:]):
+        return None
+    total = 0
+    for n in nums:
+        total = total * 60 + n
+    return total
+
+
+def build_ffmpeg_options(base: dict, effect: str = "off", seek: int = 0) -> dict:
+    """Copy. Shared default stays put."""
+    before = base.get("before_options") or ""
+    if seek > 0:
+        before = f"{before} -ss {int(seek)}".strip()
+    options = base.get("options") or "-vn"
+    af = _EFFECT_AF.get(effect or "")
+    if af:
+        options = f"{options} -af {af}"
+    return {"before_options": before, "options": options}
+
+
+def fetch_lyrics(title: str) -> str:
+    """Plain lyrics from LRCLIB, else synced. Empty string if nothing matches."""
+
+    def get(url: str):
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "JotaroBot/1.0 (discord)"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.load(resp)
+
+    def pick(data) -> str:
+        if not isinstance(data, dict):
+            return ""
+        return (data.get("plainLyrics") or data.get("syncedLyrics") or "").strip()
+
+    text = ""
+    try:
+        text = pick(get(
+            "https://lrclib.net/api/get?" + urllib.parse.urlencode({"track_name": title})
+        ))
+    except Exception:
+        text = ""
+    if not text:
+        try:
+            data = get(
+                "https://lrclib.net/api/search?" + urllib.parse.urlencode({"q": title})
+            )
+        except Exception:
+            data = None
+        if isinstance(data, list):
+            for hit in data:
+                text = pick(hit)
+                if text:
+                    break
+    return text[:2000]
 
 
 class TrackAudio(FFmpegPCMAudio):
@@ -96,10 +170,13 @@ class GuildQueue:
     def __init__(self):
         self.songs: list[SongInfo] = []
         self.history: list[SongInfo] = []
+        self.played: list[tuple[str, str]] = []  # (title, url), newest first
         self.current: Optional[SongInfo] = None
         self.skipping = False
         self.stopping = False
         self.looping = False
+        self.effect = "off"
+        self.play_gen = 0
 
     def add(self, song: SongInfo) -> int:
         self.songs.append(song)
@@ -128,6 +205,27 @@ class GuildQueue:
         if self.songs:
             return self.songs.pop()
         return None
+
+    def remove_at(self, index: int) -> Optional[SongInfo]:
+        """1-based pending index. None if empty or out of range."""
+        i = index - 1
+        if i < 0 or i >= len(self.songs):
+            return None
+        return self.songs.pop(i)
+
+    def note_played(self, song: SongInfo):
+        self.played.insert(0, (song.title, song.url))
+        del self.played[10:]
+
+    def requeue_played(self, index: int, ffmpeg_options: dict) -> Optional[SongInfo]:
+        """1 = most recent. Append a copy onto the pending queue."""
+        i = index - 1
+        if i < 0 or i >= len(self.played):
+            return None
+        title, url = self.played[i]
+        song = SongInfo(title, url, "", "", ffmpeg_options)
+        self.add(song)
+        return song
 
     def move_up(self, index: int) -> bool:
         """1-based pending index. Swap with previous."""
@@ -381,15 +479,35 @@ class music_cog(commands.Cog):
         voice: discord.VoiceClient,
         song: SongInfo,
         interaction: discord.Interaction,
+        seek: int = 0,
     ):
         # FFmpegPCMAudio cannot be replayed after stop; always build a fresh source.
         song._audio = None
+        queue = self.get_queue(voice.guild.id)
+        opts = build_ffmpeg_options(song.ffmpeg_options, queue.effect, seek)
         vol = self.get_volume_percent(voice.channel.id) / 100.0
-        source = VolumeAudio(song.audio, volume=vol)
+        source = VolumeAudio(TrackAudio(song.audio_url, **opts), volume=vol)
+        gen = queue.play_gen
         voice.play(
             source,
-            after=lambda error, s=song: self.after_play(interaction, error, s),
+            after=lambda error, s=song, g=gen: self.after_play(interaction, error, s, g),
         )
+
+    def restart_current(
+        self,
+        voice: discord.VoiceClient,
+        interaction: discord.Interaction,
+        seek: int = 0,
+    ) -> bool:
+        """Rebuild the current source. Bump play_gen so the old after-callback does not skip."""
+        queue = self.get_queue(interaction.guild_id)
+        song = queue.current
+        if not song or not voice or not (voice.is_playing() or voice.is_paused()):
+            return False
+        queue.play_gen += 1
+        voice.stop()
+        self.play_audio(voice, song, interaction, seek=seek)
+        return True
 
     async def print_queue(self, interaction: discord.Interaction):
         if err := self.same_vc_error(interaction):
@@ -434,11 +552,15 @@ class music_cog(commands.Cog):
         interaction: discord.Interaction,
         error: Optional[BaseException] = None,
         song: Optional[SongInfo] = None,
+        gen: Optional[int] = None,
     ):
         # stopping: queue cleared — do not advance.
         # ffmpeg error: refresh this song once from song.url, then advance.
         # skipping or natural end: clear skip flag, then play_next.
+        # gen mismatch: seek/effect rebuilt this source; ignore the old player.
         queue = self.get_queue(interaction.guild_id)
+        if gen is not None and gen != queue.play_gen:
+            return
         if error:
             print(f"playback error: {error}")
         if queue.stopping:
@@ -524,6 +646,7 @@ class music_cog(commands.Cog):
             song.playback_retried = True
             await self._refresh_stream(song)
             self.play_audio(voice, song, interaction)
+        self.get_queue(interaction.guild_id).note_played(song)
         self.schedule_preload(interaction.guild_id)
 
     async def _retry_playback(self, interaction: discord.Interaction, song: SongInfo):
@@ -932,6 +1055,99 @@ class music_cog(commands.Cog):
         else:
             queue.history.clear()
             await interaction.response.send_message("Queue loop OFF. Owari da.")
+
+    @app_commands.command(name="remove", description="Remove a pending song by position")
+    @app_commands.describe(position="1-based index in the pending queue")
+    async def remove(self, interaction: discord.Interaction, position: int):
+        if err := self.same_vc_error(interaction):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        song = self.get_queue(interaction.guild_id).remove_at(position)
+        if not song:
+            await interaction.response.send_message("Can't remove that, Teme.", ephemeral=True)
+            return
+        self.schedule_preload(interaction.guild_id)
+        await interaction.response.send_message(f"Removed **{song.title}**. Yare Yare.")
+
+    @app_commands.command(name="seek", description="Seek the current song")
+    @app_commands.describe(time="Seconds, m:ss, or h:mm:ss")
+    async def seek(self, interaction: discord.Interaction, time: str):
+        if err := self.same_vc_error(interaction):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        seconds = parse_seek(time)
+        if seconds is None:
+            await interaction.response.send_message("Bad time, Teme.", ephemeral=True)
+            return
+        voice = interaction.guild.voice_client if interaction.guild else None
+        if not voice or not self.restart_current(voice, interaction, seek=seconds):
+            await interaction.response.send_message("Nothing is playing, Teme.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"Seeked to {time}. Yare Yare...")
+
+    @app_commands.command(name="lyrics", description="Lyrics for the current song")
+    async def lyrics(self, interaction: discord.Interaction):
+        if err := self.same_vc_error(interaction):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        song = self.get_queue(interaction.guild_id).current
+        if not song:
+            await interaction.response.send_message("Nothing playing, Teme.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        text = await asyncio.to_thread(fetch_lyrics, song.title)
+        if not text:
+            await interaction.followup.send("Yare Yare... no lyrics for this one, Teme.")
+            return
+        await interaction.followup.send(text[:2000])
+
+    @app_commands.command(name="history", description="Recently played songs")
+    @app_commands.describe(requeue="Requeue this entry onto the pending queue (1 = most recent)")
+    async def history(
+        self, interaction: discord.Interaction, requeue: Optional[int] = None
+    ):
+        if err := self.same_vc_error(interaction):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        queue = self.get_queue(interaction.guild_id)
+        if requeue is not None:
+            song = queue.requeue_played(requeue, self.ffmpeg_options)
+            if not song:
+                await interaction.response.send_message(
+                    "Can't requeue that, Teme.", ephemeral=True
+                )
+                return
+            self.schedule_preload(interaction.guild_id)
+            await interaction.response.send_message(
+                f"Requeued **{song.title}**. Yare Yare..."
+            )
+            return
+        if not queue.played:
+            await interaction.response.send_message("No history yet, Teme.", ephemeral=True)
+            return
+        lines = [
+            f"{i}. [{title}]({url})"
+            for i, (title, url) in enumerate(queue.played, start=1)
+        ]
+        await interaction.response.send_message("\n".join(lines)[:2000])
+
+    @app_commands.command(name="effect", description="Bass, nightcore, or off")
+    @app_commands.describe(choice="off, bass, or nightcore")
+    @app_commands.choices(choice=[
+        app_commands.Choice(name="off", value="off"),
+        app_commands.Choice(name="bass", value="bass"),
+        app_commands.Choice(name="nightcore", value="nightcore"),
+    ])
+    async def effect(self, interaction: discord.Interaction, choice: str):
+        if err := self.same_vc_error(interaction):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        queue = self.get_queue(interaction.guild_id)
+        queue.effect = choice if choice in ("off", "bass", "nightcore") else "off"
+        voice = interaction.guild.voice_client if interaction.guild else None
+        if voice:
+            self.restart_current(voice, interaction, seek=0)
+        await interaction.response.send_message(f"Effect: {queue.effect}. Yare Yare...")
 
     @app_commands.command(name="clear_queue", description="Clear the current queue")
     async def clear_queue(self, interaction: discord.Interaction):

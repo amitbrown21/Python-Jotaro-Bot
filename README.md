@@ -6,7 +6,7 @@ JoJo-themed Discord bot: music (yt-dlp), D&D helpers, slash commands only.
 
 ## Features
 
-- Music: `/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/shuffle` `/loop` `/clear_queue` `/remove_last` `/leave` `/localplay`
+- Music: `/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/shuffle` `/loop` `/clear_queue` `/remove_last` `/remove` `/seek` `/lyrics` `/history` `/effect` `/leave` `/localplay`
 - D&D: `/roll` `/generate_stats` `/initiative` `/generate_character` `/loot` `/weather` `/coinflip`
 - Other: `/ping` `/hello` `/sync`
 
