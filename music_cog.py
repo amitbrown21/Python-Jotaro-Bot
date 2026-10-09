@@ -196,6 +196,76 @@ def tracks_from_queue(queue: "GuildQueue") -> list:
     return tracks
 
 
+MAX_PLAYLIST_ENTRIES = 200
+MAX_PLAY_FAILURES = 20  # consecutive unplayable songs skipped before play_next gives up
+_DEAD_TITLES = ("[private video]", "[deleted video]")
+
+
+def track_from_flat_entry(entry: Optional[dict]) -> Optional[dict]:
+    """Flat yt-dlp playlist entry -> {title, url, thumbnail}. None for private/deleted/no URL."""
+    if not isinstance(entry, dict):
+        return None
+    title = (entry.get("title") or "").strip()
+    if title.lower() in _DEAD_TITLES:
+        return None
+    url = entry.get("webpage_url") or entry.get("url") or ""
+    if not url.startswith("http"):
+        if entry.get("id") and (entry.get("ie_key") or "").lower() == "youtube":
+            url = f"https://www.youtube.com/watch?v={entry['id']}"
+        else:
+            return None
+    thumb = entry.get("thumbnail") or ""
+    if not thumb:
+        thumbs = [t for t in (entry.get("thumbnails") or []) if isinstance(t, dict)]
+        thumb = (thumbs[-1].get("url") or "") if thumbs else ""
+    return {"title": title or "Unknown", "url": url, "thumbnail": thumb}
+
+
+def tracks_from_flat_entries(entries) -> list:
+    tracks = []
+    for entry in entries or []:
+        track = track_from_flat_entry(entry)
+        if track:
+            tracks.append(track)
+    return tracks
+
+
+def songs_from_tracks(tracks: list, ffmpeg_options: dict, requester=None) -> list:
+    """Stored/flat tracks -> unresolved SongInfo (empty audio_url; resolved lazily at play)."""
+    songs = []
+    for track in tracks or []:
+        url = (track or {}).get("url") or ""
+        if not url.startswith("http"):
+            continue
+        songs.append(
+            SongInfo(
+                track.get("title") or "Unknown",
+                url,
+                "",
+                track.get("thumbnail") or "",
+                ffmpeg_options,
+                requester_id=getattr(requester, "id", None),
+                requester_name=getattr(requester, "display_name", None),
+            )
+        )
+    return songs
+
+
+def clip_lines(lines: list, limit: int = 4000) -> str:
+    """Join lines, cutting at `limit` chars with a '+N more' tail (embed descriptions cap at 4096)."""
+    text = "\n".join(lines)
+    if len(text) <= limit:
+        return text
+    out, size = [], 0
+    for i, line in enumerate(lines):
+        if size + len(line) + 1 > limit - 30:
+            out.append(f"…and {len(lines) - i} more")
+            break
+        out.append(line)
+        size += len(line) + 1
+    return "\n".join(out)
+
+
 class GuildLibrary:
     """Per-guild saved playlists and the autoplay toggle. JSON on disk."""
 
@@ -688,6 +758,13 @@ class music_cog(commands.Cog):
         }
 
         self.ytdl = yt_dlp.YoutubeDL(self.yt_dl_opts)
+        # Playlist entries come back as bare metadata (title/url/thumbnail); no per-entry
+        # format resolution. Single videos are still fully resolved.
+        self.ytdl_flat = yt_dlp.YoutubeDL({
+            **self.yt_dl_opts,
+            'extract_flat': 'in_playlist',
+            'playlistend': MAX_PLAYLIST_ENTRIES,
+        })
         self._search_cache: Dict[str, str] = {}
         self._cache_max_size = 100
         # ponytail: per-guild lock; split locks if cross-guild contention matters
@@ -831,7 +908,7 @@ class music_cog(commands.Cog):
 
         return discord.Embed(
             title="Current Queue",
-            description="\n".join(lines),
+            description=clip_lines(lines),
             color=0x3498db,
         )
 
@@ -964,6 +1041,10 @@ class music_cog(commands.Cog):
         async with self._extract_lock:
             return await asyncio.to_thread(self.ytdl.extract_info, url, False)
 
+    async def _extract_flat(self, url: str):
+        async with self._extract_lock:
+            return await asyncio.to_thread(self.ytdl_flat.extract_info, url, False)
+
     async def _refresh_stream(self, song: SongInfo) -> bool:
         """Re-extract a direct stream from the stable webpage, never from audio_url."""
         if not song.url:
@@ -998,6 +1079,9 @@ class music_cog(commands.Cog):
     ):
         song.playback_retried = False
         await self._ensure_stream(song)
+        if not song.audio_url:
+            # unavailable/private/region-locked: let the caller skip it
+            raise RuntimeError(f"no stream for {song.url}")
         try:
             self.play_audio(voice, song, interaction)
         except Exception as e:
@@ -1067,8 +1151,15 @@ class music_cog(commands.Cog):
                     want_autoplay = True
 
             if failed:
-                # ponytail: stop after 3 bad URLs so a looping track cannot recurse forever
-                if failures < 2:
+                # ponytail: bounded so a looping dead track cannot recurse forever; high enough
+                # that a playlist with a few unavailable videos (found lazily) still plays on
+                if failures == 0:
+                    await self._announce(
+                        interaction,
+                        f"Can't load **{song.title}**, skipping it, Teme."
+                        if song else "Can't load that song, skipping it, Teme.",
+                    )
+                if failures < MAX_PLAY_FAILURES - 1:
                     await self.play_next(interaction, failures + 1)
                 return
 
@@ -1117,7 +1208,7 @@ class music_cog(commands.Cog):
                                 song = None
 
             if failed:
-                if failures < 2:
+                if failures < MAX_PLAY_FAILURES - 1:
                     await self.play_next(interaction, failures + 1)
                 return
 
@@ -1177,22 +1268,6 @@ class music_cog(commands.Cog):
         related.requester_name = "Autoplay"
         return related
 
-    async def _songs_from_tracks(self, tracks: list, requester) -> list:
-        songs = []
-        for track in tracks:
-            url = (track or {}).get("url") or ""
-            if not url.startswith("http"):
-                continue
-            try:
-                info = await self._extract(url)
-            except Exception as e:
-                print(f"playlist extract failed: {e}")
-                continue
-            if not info or info.get("_type") == "playlist":
-                continue
-            songs.append(self.create_song_info(info, url, requester))
-        return songs
-
     async def resolve_source(self, query: str) -> Optional[str]:
         """Resolve a search query or URL to a playable webpage URL."""
         if query.startswith("http://") or query.startswith("https://"):
@@ -1203,7 +1278,8 @@ class music_cog(commands.Cog):
             return self._search_cache[cache_key]
 
         try:
-            info = await self._extract(f"ytsearch1:{query}")
+            # flat: we only need the video URL; play() resolves the stream once
+            info = await self._extract_flat(f"ytsearch1:{query}")
         except yt_dlp.utils.DownloadError as e:
             print(f"resolve_source DownloadError: {e}")
             return None
@@ -1264,7 +1340,8 @@ class music_cog(commands.Cog):
                 return
 
             try:
-                info = await self._extract(source)
+                # flat for playlists (metadata only); single videos still fully resolved
+                info = await self._extract_flat(source)
             except yt_dlp.utils.DownloadError as e:
                 print(f"play DownloadError: {e}")
                 await interaction.followup.send("Can't play that, Teme.")
@@ -1281,6 +1358,45 @@ class music_cog(commands.Cog):
                 responded = True
                 return
 
+            playlist_songs = []
+            embed = None
+            first_failed = False
+            if info.get('_type') == 'playlist':
+                raw_entries = [e for e in (info.get('entries') or []) if e]
+                tracks = tracks_from_flat_entries(raw_entries)
+                if not tracks:
+                    await interaction.followup.send("Playlist is empty, Teme.")
+                    responded = True
+                    return
+                # Unresolved songs: stream URLs are fetched lazily (first one on start,
+                # the rest via preload as each comes up).
+                playlist_songs = songs_from_tracks(
+                    tracks, self.ffmpeg_options, interaction.user
+                )
+                skipped = len(raw_entries) - len(tracks)
+                footer = f"Playlist length: {len(tracks)}"
+                if skipped:
+                    footer += f" ({skipped} unavailable skipped)"
+                if len(raw_entries) >= MAX_PLAYLIST_ENTRIES:
+                    footer += f" - capped at first {MAX_PLAYLIST_ENTRIES}"
+                embed = discord.Embed(
+                    title=info.get('title', 'Playlist'),
+                    url=info.get('webpage_url', ''),
+                    description=f"Adding {len(tracks)} songs to queue...",
+                    color=0xffff00,
+                )
+                embed.set_author(
+                    name=interaction.user.display_name,
+                    icon_url=(
+                        interaction.user.avatar.url
+                        if interaction.user.avatar
+                        else None
+                    ),
+                )
+                if tracks[0]["thumbnail"]:
+                    embed.set_thumbnail(url=tracks[0]["thumbnail"])
+                embed.set_footer(text=footer)
+
             lock = self.get_guild_lock(interaction.guild_id)
             async with lock:
                 voice = discord.utils.get(
@@ -1291,40 +1407,8 @@ class music_cog(commands.Cog):
 
                 queue = self.get_queue(interaction.guild_id)
 
-                if info.get('_type') == 'playlist':
-                    playlist_name = info.get('title', 'Playlist')
-                    entries = [e for e in (info.get('entries') or []) if e]
-
-                    if not entries:
-                        await interaction.followup.send("Playlist is empty, Teme.")
-                        responded = True
-                        return
-
-                    first_song = entries[0]
-                    thumbnail = first_song.get('thumbnail', '')
-
-                    embed = discord.Embed(
-                        title=playlist_name,
-                        url=info.get('webpage_url', ''),
-                        description=f"Adding {len(entries)} songs to queue...",
-                        color=0xffff00,
-                    )
-                    embed.set_author(
-                        name=interaction.user.display_name,
-                        icon_url=(
-                            interaction.user.avatar.url
-                            if interaction.user.avatar
-                            else None
-                        ),
-                    )
-                    if thumbnail:
-                        embed.set_thumbnail(url=thumbnail)
-                    embed.set_footer(text=f'Playlist length: {len(entries)}')
-
-                    for entry in entries:
-                        song = self.create_song_info(
-                            entry, entry.get('webpage_url', ''), interaction.user
-                        )
+                if playlist_songs:
+                    for song in playlist_songs:
                         queue.add(song)
 
                     starting = not voice.is_playing() and not voice.is_paused()
@@ -1339,10 +1423,14 @@ class music_cog(commands.Cog):
                     responded = True
 
                     if started:
-                        await self.client.change_presence(
-                            activity=discord.Game(name=started.title)
-                        )
-                        await self.begin_playback(voice, started, interaction)
+                        try:
+                            await self.client.change_presence(
+                                activity=discord.Game(name=started.title)
+                            )
+                            await self.begin_playback(voice, started, interaction)
+                        except Exception as e:
+                            print(f"playlist first track failed: {e}")
+                            first_failed = True
                     else:
                         self.schedule_preload(interaction.guild_id)
                 else:
@@ -1374,6 +1462,10 @@ class music_cog(commands.Cog):
                             )
                         )
                         responded = True
+
+            if first_failed:
+                # first entry was dead; play_next skips on to the next playable one
+                await self.play_next(interaction)
         except Exception as e:
             print(f"play failed: {e}")
             traceback.print_exc()
@@ -1713,13 +1805,15 @@ class music_cog(commands.Cog):
             )
             return
 
-        songs = await self._songs_from_tracks(tracks, interaction.user)
+        # Instant: stored title/url/thumbnail only. Streams resolve lazily at play/preload.
+        songs = songs_from_tracks(tracks, self.ffmpeg_options, interaction.user)
         if not songs:
             await interaction.followup.send("Can't play that playlist, Teme.")
             return
 
         channel = interaction.user.voice.channel
         started = None
+        first_failed = False
         try:
             lock = self.get_guild_lock(interaction.guild_id)
             async with lock:
@@ -1740,7 +1834,11 @@ class music_cog(commands.Cog):
                         )
                     except Exception as e:
                         print(f"playlist presence failed: {e}")
-                    await self.begin_playback(voice, started, interaction)
+                    try:
+                        await self.begin_playback(voice, started, interaction)
+                    except Exception as e:
+                        print(f"playlist first track failed: {e}")
+                        first_failed = True
                 else:
                     self.schedule_preload(interaction.guild_id)
         except Exception as e:
@@ -1750,6 +1848,10 @@ class music_cog(commands.Cog):
 
         skipped = len(tracks) - len(songs)
         label = saved.get("name") or name.strip()
+        if first_failed:
+            # first entry was dead; play_next skips to the next playable one and announces it
+            await self.play_next(interaction)
+            started = None
         if started:
             await interaction.followup.send(
                 embed=self.song_embed(started, interaction, "Now Playing..."),

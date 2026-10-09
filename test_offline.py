@@ -9,6 +9,10 @@ from music_cog import (
     QueueControlView,
     SongInfo,
     build_ffmpeg_options,
+    clip_lines,
+    songs_from_tracks,
+    track_from_flat_entry,
+    tracks_from_flat_entries,
     library_path,
     music_cog,
     parse_seek,
@@ -367,7 +371,88 @@ def test_idle_leave_delay_cancel():
     asyncio.run(run())
 
 
+def test_flat_playlist_to_songs():
+    flat = [
+        {"title": "A", "url": "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+         "thumbnails": [{"url": "small"}, {"url": "big"}]},
+        {"title": "[Private video]", "url": "https://www.youtube.com/watch?v=bbbbbbbbbbb"},
+        {"title": "[Deleted video]", "url": "https://www.youtube.com/watch?v=ccccccccccc"},
+        None,
+        {"title": "no url"},
+        {"title": "C", "id": "ddddddddddd", "ie_key": "Youtube", "thumbnail": "t"},
+        {"title": "D", "webpage_url": "https://x/d", "url": "https://x/stream"},
+    ]
+    tracks = tracks_from_flat_entries(flat)
+    assert [t["title"] for t in tracks] == ["A", "C", "D"]
+    assert tracks[0]["thumbnail"] == "big"
+    assert tracks[1] == {
+        "title": "C",
+        "url": "https://www.youtube.com/watch?v=ddddddddddd",
+        "thumbnail": "t",
+    }
+    assert tracks[2]["url"] == "https://x/d"
+    assert track_from_flat_entry({"url": "https://x/y"})["title"] == "Unknown"
+
+    class User:
+        id = 7
+        display_name = "Jotaro"
+
+    opts = {"before_options": "", "options": ""}
+    songs = songs_from_tracks(
+        tracks + [{"title": "bad", "url": "nope"}, {}], opts, User()
+    )
+    assert [s.title for s in songs] == ["A", "C", "D"]
+    assert all(s.audio_url == "" and s._audio is None for s in songs)
+    assert songs[0].requester_id == 7 and songs[0].requester_name == "Jotaro"
+    assert songs[0].thumbnail == "big"
+    assert stream_url_stale(songs[0].audio_url, 0) is True  # lazy: needs resolving
+    assert songs_from_tracks(None, opts) == []
+
+    text = clip_lines([f"{i}. {'x' * 80}" for i in range(200)])
+    assert len(text) <= 4096 and text.endswith("more")
+    assert clip_lines(["a", "b"]) == "a\nb"
+
+
+def test_lazy_stream_resolve():
+    """Saved/flat songs have no stream; _ensure_stream resolves one and only when stale."""
+    import asyncio
+
+    class Host:
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        _ensure_stream = music_cog._ensure_stream
+        _refresh_stream = music_cog._refresh_stream
+
+        async def _extract(self, url):
+            self.calls.append(url)
+            return self.result
+
+    async def run():
+        opts = {"before_options": "", "options": ""}
+        song = songs_from_tracks(
+            [{"title": "A", "url": "https://www.youtube.com/watch?v=aaaaaaaaaaa"}], opts
+        )[0]
+        host = Host({"url": "https://rr.googlevideo.com/videoplayback?expire=9999999999"})
+        await host._ensure_stream(song)
+        assert host.calls == [song.url]
+        assert song.audio_url.startswith("https://rr.googlevideo.com")
+        await host._ensure_stream(song)  # fresh now: no second extraction
+        assert len(host.calls) == 1
+
+        dead = songs_from_tracks(
+            [{"title": "B", "url": "https://www.youtube.com/watch?v=bbbbbbbbbbb"}], opts
+        )[0]
+        await Host(None)._ensure_stream(dead)
+        assert dead.audio_url == ""  # unresolved; begin_playback raises so play_next skips it
+
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
+    test_flat_playlist_to_songs()
+    test_lazy_stream_resolve()
     test_roll_dice_expr()
     test_stream_url_stale()
     test_guild_queue()
