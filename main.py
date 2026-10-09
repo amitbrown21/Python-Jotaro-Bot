@@ -42,11 +42,13 @@ async def on_ready():
     try:
         if guild_ids:
             for guild_id in guild_ids:
-                await client.tree.sync(guild=discord.Object(id=guild_id))
-            print(f"Synced commands to {len(guild_ids)} guilds")
+                guild = discord.Object(id=guild_id)
+                client.tree.copy_global_to(guild=guild)
+                synced = await client.tree.sync(guild=guild)
+                print(f"Synced {len(synced)} commands to guild {guild_id}")
         else:
-            await client.tree.sync()
-            print("Synced commands globally")
+            synced = await client.tree.sync()
+            print(f"Synced {len(synced)} commands globally")
     except discord.errors.Forbidden as e:
         print(f"Error syncing commands: {e}")
 
