@@ -5,8 +5,8 @@ import sys
 import discord
 from discord.ext import commands
 
-from admin_cog import admin_cog
-from config import TOKEN, guild_ids
+from admin_cog import admin_cog, sync_app_commands
+from config import TOKEN
 from dnd_cog import dnd_cog
 from music_cog import music_cog
 
@@ -40,16 +40,8 @@ async def on_ready():
             print(f"Failed to load {name}: {e}")
 
     try:
-        if guild_ids:
-            for guild_id in guild_ids:
-                guild = discord.Object(id=guild_id)
-                client.tree.copy_global_to(guild=guild)
-                synced = await client.tree.sync(guild=guild)
-                print(f"Synced {len(synced)} commands to guild {guild_id}")
-        else:
-            synced = await client.tree.sync()
-            print(f"Synced {len(synced)} commands globally")
-    except discord.errors.Forbidden as e:
+        await sync_app_commands(client)
+    except (discord.errors.Forbidden, discord.HTTPException) as e:
         print(f"Error syncing commands: {e}")
 
     print('Yare Yare Daze...')

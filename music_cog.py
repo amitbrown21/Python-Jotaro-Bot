@@ -133,6 +133,148 @@ def volumes_path() -> str:
     return "/config/volumes.json" if os.path.isdir("/config") else "./volumes.json"
 
 
+def library_path() -> str:
+    return "/config/library.json" if os.path.isdir("/config") else "./library.json"
+
+
+IDLE_LEAVE_SECONDS = 60
+
+_VIDEO_ID_RE = re.compile(
+    r"(?:[?&]v=|youtu\.be/|shorts/|embed/)([A-Za-z0-9_-]{6,})"
+)
+
+
+def video_id(url: Optional[str]) -> str:
+    if not url:
+        return ""
+    match = _VIDEO_ID_RE.search(url)
+    return match.group(1) if match else ""
+
+
+def pick_related_entry(
+    entries: list,
+    origin_url: str,
+    skip_urls: set,
+) -> Optional[dict]:
+    """First search hit that is not the song we just finished or a recent play."""
+    origin = video_id(origin_url)
+    skip_ids = {video_id(url) for url in skip_urls}
+    skip_ids.discard("")
+    for entry in entries:
+        if not entry:
+            continue
+        page = entry.get("webpage_url") or ""
+        if not page:
+            continue
+        vid = video_id(page)
+        if page in skip_urls or (vid and (vid == origin or vid in skip_ids)):
+            continue
+        return entry
+    return None
+
+
+def track_from_song(song: "SongInfo") -> Optional[dict]:
+    if not song.url:
+        return None
+    return {
+        "title": song.title or "Unknown",
+        "url": song.url,
+        "thumbnail": song.thumbnail or "",
+    }
+
+
+def tracks_from_queue(queue: "GuildQueue") -> list:
+    songs = []
+    if queue.current:
+        songs.append(queue.current)
+    songs.extend(queue.songs)
+    tracks = []
+    for song in songs:
+        track = track_from_song(song)
+        if track:
+            tracks.append(track)
+    return tracks
+
+
+class GuildLibrary:
+    """Per-guild saved playlists and the autoplay toggle. JSON on disk."""
+
+    def __init__(self, guilds: Optional[dict] = None):
+        self.guilds = guilds if isinstance(guilds, dict) else {}
+
+    @classmethod
+    def load(cls, path: str) -> "GuildLibrary":
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return cls()
+        return cls(data if isinstance(data, dict) else {})
+
+    def save(self, path: str):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.guilds, f)
+
+    def _bucket(self, guild_id: int) -> dict:
+        key = str(guild_id)
+        bucket = self.guilds.get(key)
+        if not isinstance(bucket, dict):
+            bucket = {"autoplay": False, "playlists": {}}
+            self.guilds[key] = bucket
+        if not isinstance(bucket.get("playlists"), dict):
+            bucket["playlists"] = {}
+        return bucket
+
+    def autoplay(self, guild_id: int) -> bool:
+        bucket = self.guilds.get(str(guild_id)) or {}
+        return bool(bucket.get("autoplay")) if isinstance(bucket, dict) else False
+
+    def toggle_autoplay(self, guild_id: int) -> bool:
+        bucket = self._bucket(guild_id)
+        bucket["autoplay"] = not bool(bucket.get("autoplay"))
+        return bucket["autoplay"]
+
+    def save_playlist(
+        self, guild_id: int, name: str, tracks: list
+    ) -> Optional[str]:
+        clean = (name or "").strip()
+        if not clean:
+            return "Give the playlist a name, Teme."
+        if len(clean) > 80:
+            return "That name is too long, Teme."
+        if not tracks:
+            return "Queue is empty, Teme."
+        self._bucket(guild_id)["playlists"][clean.lower()] = {
+            "name": clean,
+            "tracks": tracks,
+        }
+        return None
+
+    def get_playlist(self, guild_id: int, name: str) -> Optional[dict]:
+        clean = (name or "").strip().lower()
+        if not clean:
+            return None
+        playlists = self._bucket(guild_id)["playlists"]
+        found = playlists.get(clean)
+        return found if isinstance(found, dict) else None
+
+    def delete_playlist(self, guild_id: int, name: str) -> bool:
+        clean = (name or "").strip().lower()
+        if not clean:
+            return False
+        playlists = self._bucket(guild_id)["playlists"]
+        if clean not in playlists:
+            return False
+        del playlists[clean]
+        return True
+
+    def list_playlists(self, guild_id: int) -> list:
+        playlists = self._bucket(guild_id)["playlists"]
+        items = [item for item in playlists.values() if isinstance(item, dict)]
+        items.sort(key=lambda item: str(item.get("name", "")).lower())
+        return items
+
+
 class SongInfo:
     """Represents a song in the queue with lazy audio loading."""
 
@@ -262,14 +404,66 @@ class GuildQueue:
 
 
 class QueueControlView(discord.ui.View):
-    """Select a pending song, then move it up / down / to front."""
+    """Reorder the pending queue and control playback from one message.
 
-    def __init__(self, cog: "music_cog", guild_id: int):
+    Buttons listen for 180 seconds, then Discord stops dispatching them.
+    Run /queue or /nowplaying again (or start another song) for a fresh row.
+    """
+
+    def __init__(
+        self,
+        cog: "music_cog",
+        guild_id: int,
+        *,
+        show_queue_button: bool = False,
+    ):
         super().__init__(timeout=180)
         self.cog = cog
         self.guild_id = guild_id
         self.selected = 1
+        if not show_queue_button:
+            self.remove_item(self.queue_btn)
+        queue = self.cog.get_queue(guild_id)
+        self._set_queue_controls(bool(queue.songs))
+        self._sync_pause_label()
+        self._sync_autoplay_label()
+
+    def _layout_playback(self, row: int):
+        for item in (
+            self.pause_btn,
+            self.skip_btn,
+            self.stop_btn,
+            self.queue_btn,
+            self.autoplay_btn,
+        ):
+            item.row = row
+
+    def _set_queue_controls(self, enabled: bool):
+        move_items = (self.move_up_btn, self.move_down_btn, self.to_front_btn)
+        if not enabled:
+            for item in list(self.children):
+                if isinstance(item, discord.ui.Select) or item in move_items:
+                    self.remove_item(item)
+            self._layout_playback(0)
+            return
+
+        for item in move_items:
+            if item not in self.children:
+                self.add_item(item)
+        self._layout_playback(2)
         self._rebuild_select()
+
+    def _sync_pause_label(self):
+        guild = self.cog.client.get_guild(self.guild_id)
+        voice = guild.voice_client if guild else None
+        self.pause_btn.label = "Resume" if voice and voice.is_paused() else "Pause"
+
+    def _sync_autoplay_label(self):
+        on = bool(self.cog.is_autoplay(self.guild_id))
+        self.autoplay_btn.label = "Autoplay: On" if on else "Autoplay: Off"
+        self.autoplay_btn.style = (
+            discord.ButtonStyle.success if on else discord.ButtonStyle.secondary
+        )
 
     def _rebuild_select(self):
         for item in list(self.children):
@@ -293,6 +487,7 @@ class QueueControlView(discord.ui.View):
             options=options,
             min_values=1,
             max_values=1,
+            row=0,
         )
 
         async def on_select(interaction: discord.Interaction):
@@ -331,37 +526,148 @@ class QueueControlView(discord.ui.View):
             return
 
         self.cog.schedule_preload(self.guild_id)
-        self._rebuild_select()
+        self._set_queue_controls(bool(queue.songs))
         embed = self.cog.build_queue_embed(queue)
-        await interaction.response.edit_message(
-            embed=embed, view=self if queue.songs else None
-        )
+        await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(label="Move up", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Move up", style=discord.ButtonStyle.secondary, row=1)
     async def move_up_btn(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         await self._move(interaction, "up")
 
-    @discord.ui.button(label="Move down", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Move down", style=discord.ButtonStyle.secondary, row=1)
     async def move_down_btn(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         await self._move(interaction, "down")
 
-    @discord.ui.button(label="To front", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="To front", style=discord.ButtonStyle.primary, row=1)
     async def to_front_btn(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         await self._move(interaction, "front")
 
+    async def _refuse(self, interaction: discord.Interaction) -> bool:
+        if err := self.cog.same_vc_error(interaction):
+            await interaction.response.send_message(err, ephemeral=True)
+            return True
+        return False
+
+    @discord.ui.button(label="Pause", style=discord.ButtonStyle.secondary, row=2)
+    async def pause_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if await self._refuse(interaction):
+            return
+        voice = interaction.guild.voice_client
+        if voice and voice.is_playing():
+            voice.pause()
+            text = "Paused, Baka Yaro"
+        elif voice and voice.is_paused():
+            voice.resume()
+            text = "Resuming..."
+        else:
+            await interaction.response.send_message(
+                "No audio is playing, Teme.", ephemeral=True
+            )
+            return
+        self._sync_pause_label()
+        await interaction.response.send_message(text, ephemeral=True)
+        try:
+            await interaction.message.edit(view=self)
+        except Exception as e:
+            print(f"pause button refresh failed: {e}")
+
+    @discord.ui.button(label="Skip", style=discord.ButtonStyle.primary, row=2)
+    async def skip_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if await self._refuse(interaction):
+            return
+        voice = interaction.guild.voice_client
+        queue = self.cog.get_queue(self.guild_id)
+        if not voice or not voice.is_playing():
+            await interaction.response.send_message(
+                "Nothing is playing..", ephemeral=True
+            )
+            return
+        if not queue:
+            await interaction.response.send_message(
+                "No songs in queue", ephemeral=True
+            )
+            return
+        queue.skipping = True
+        await interaction.response.send_message("Skipping..", ephemeral=True)
+        voice.stop()
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, row=2)
+    async def stop_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if await self._refuse(interaction):
+            return
+        voice = interaction.guild.voice_client
+        if voice and (voice.is_paused() or voice.is_playing()):
+            queue = self.cog.get_queue(self.guild_id)
+            queue.stopping = True
+            queue.clear()
+            voice.stop()
+            await voice.disconnect()
+            await self.cog.client.change_presence(
+                status=discord.Status.do_not_disturb
+            )
+            await interaction.response.send_message("Yare Yare... I'll be back")
+            return
+        await interaction.response.send_message(
+            "Nothing to stop, Teme.", ephemeral=True
+        )
+
+    @discord.ui.button(label="Queue", style=discord.ButtonStyle.secondary, row=2)
+    async def queue_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if await self._refuse(interaction):
+            return
+        queue = self.cog.get_queue(self.guild_id)
+        if not queue.current and not queue.songs:
+            await interaction.response.send_message(
+                "Queue is empty, Teme.", ephemeral=True
+            )
+            return
+        embed = self.cog.build_queue_embed(queue)
+        view = QueueControlView(self.cog, self.guild_id)
+        await interaction.response.send_message(embed=embed, view=view)
+
+    @discord.ui.button(label="Autoplay: Off", style=discord.ButtonStyle.secondary, row=2)
+    async def autoplay_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if await self._refuse(interaction):
+            return
+        on = self.cog.toggle_autoplay(self.guild_id)
+        self._sync_autoplay_label()
+        text = "Autoplay ON. Yare Yare..." if on else "Autoplay OFF. Owari da."
+        await interaction.response.send_message(text, ephemeral=True)
+        try:
+            await interaction.message.edit(view=self)
+        except Exception as e:
+            print(f"autoplay button refresh failed: {e}")
+
 
 class music_cog(commands.Cog):
+    playlist = app_commands.Group(
+        name="playlist",
+        description="Save and replay this server's queues",
+    )
 
     def __init__(self, client: commands.Bot):
         self.client = client
         self.queues: Dict[int, GuildQueue] = {}
         self.volumes: Dict[int, int] = self._load_volumes()
+        self.library = GuildLibrary.load(library_path())
+        self._idle_tasks: Dict[int, asyncio.Task] = {}
+        self._idle_channel: Dict[int, int] = {}
 
         self.yt_dl_opts = {
             'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
@@ -404,6 +710,61 @@ class music_cog(commands.Cog):
 
     def get_volume_percent(self, channel_id: int) -> int:
         return self.volumes.get(channel_id, 100)
+
+    def is_autoplay(self, guild_id: int) -> bool:
+        return self.library.autoplay(guild_id)
+
+    def toggle_autoplay(self, guild_id: int) -> bool:
+        on = self.library.toggle_autoplay(guild_id)
+        self.library.save(library_path())
+        return on
+
+    def _cancel_idle(self, guild_id: int):
+        self._idle_channel.pop(guild_id, None)
+        task = self._idle_tasks.pop(guild_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    def _schedule_idle(self, guild_id: int, channel_id: int):
+        existing = self._idle_tasks.get(guild_id)
+        if (
+            existing
+            and not existing.done()
+            and self._idle_channel.get(guild_id) == channel_id
+        ):
+            return
+        self._cancel_idle(guild_id)
+        self._idle_channel[guild_id] = channel_id
+        self._idle_tasks[guild_id] = asyncio.create_task(
+            self._idle_leave(guild_id, channel_id)
+        )
+
+    async def _idle_leave(self, guild_id: int, channel_id: int):
+        try:
+            await asyncio.sleep(IDLE_LEAVE_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        guild = self.client.get_guild(guild_id)
+        voice = guild.voice_client if guild else None
+        if not voice or not voice.channel or voice.channel.id != channel_id:
+            return
+        if len(voice.channel.members) > 1:
+            return
+        queue = self.get_queue(guild_id)
+        queue.stopping = True
+        queue.clear()
+        await voice.disconnect()
+        try:
+            await self.client.change_presence(status=discord.Status.do_not_disturb)
+        except Exception as e:
+            print(f"idle leave presence failed: {e}")
+        general_channel = self.find_general_channel(guild)
+        if general_channel:
+            await general_channel.send(
+                "I'm alone here, leaving the voice channel. Yare Yare..."
+            )
+        self._idle_tasks.pop(guild_id, None)
+        self._idle_channel.pop(guild_id, None)
 
     def same_vc_error(self, interaction: discord.Interaction) -> Optional[str]:
         voice = interaction.guild.voice_client if interaction.guild else None
@@ -522,7 +883,7 @@ class music_cog(commands.Cog):
             return
 
         embed = self.build_queue_embed(queue)
-        view = QueueControlView(self, interaction.guild_id) if queue.songs else None
+        view = QueueControlView(self, interaction.guild_id)
         await interaction.response.send_message(embed=embed, view=view)
 
     def find_general_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
@@ -673,6 +1034,8 @@ class music_cog(commands.Cog):
         try:
             song = None
             failed = False
+            want_autoplay = False
+            finished = None
             lock = self.get_guild_lock(interaction.guild_id)
             async with lock:
                 queue = self.get_queue(interaction.guild_id)
@@ -680,6 +1043,7 @@ class music_cog(commands.Cog):
                 if not voice:
                     return
 
+                finished = queue.current
                 song = queue.pop_next()
                 if song:
                     try:
@@ -694,6 +1058,13 @@ class music_cog(commands.Cog):
                     except Exception as e:
                         print(f"begin_playback failed: {e}")
                         failed = True
+                elif (
+                    finished
+                    and finished.url
+                    and self.is_autoplay(interaction.guild_id)
+                    and not queue.stopping
+                ):
+                    want_autoplay = True
 
             if failed:
                 # ponytail: stop after 3 bad URLs so a looping track cannot recurse forever
@@ -701,12 +1072,67 @@ class music_cog(commands.Cog):
                     await self.play_next(interaction, failures + 1)
                 return
 
+            if want_autoplay and song is None and finished is not None:
+                skip_urls = {finished.url}
+                skip_urls.update(
+                    url for _, url in self.get_queue(interaction.guild_id).played
+                )
+                related = None
+                try:
+                    related = await self.related_song(finished, skip_urls)
+                except Exception as e:
+                    print(f"autoplay lookup failed: {e}")
+                if related:
+                    async with lock:
+                        queue = self.get_queue(interaction.guild_id)
+                        voice = (
+                            interaction.guild.voice_client
+                            if interaction.guild
+                            else None
+                        )
+                        busy = bool(
+                            voice and (voice.is_playing() or voice.is_paused())
+                        )
+                        if (
+                            voice
+                            and voice.is_connected()
+                            and not busy
+                            and not queue.current
+                            and not queue.songs
+                            and not queue.stopping
+                        ):
+                            queue.current = related
+                            song = related
+                            try:
+                                await self.client.change_presence(
+                                    activity=discord.Game(name=song.title)
+                                )
+                            except Exception as e:
+                                print(f"play_next presence failed: {e}")
+                            try:
+                                await self.begin_playback(voice, song, interaction)
+                            except Exception as e:
+                                print(f"autoplay playback failed: {e}")
+                                failed = True
+                                song = None
+
+            if failed:
+                if failures < 2:
+                    await self.play_next(interaction, failures + 1)
+                return
+
+            queue = self.get_queue(interaction.guild_id)
+            voice = interaction.guild.voice_client if interaction.guild else None
+            busy = bool(voice and (voice.is_playing() or voice.is_paused()))
             if song:
                 await self._announce(
                     interaction,
                     embed=self.song_embed(song, interaction, "Now Playing..."),
+                    view=QueueControlView(
+                        self, interaction.guild_id, show_queue_button=True
+                    ),
                 )
-            else:
+            elif not queue.stopping and not busy and not queue.current and not queue.songs:
                 try:
                     await self.client.change_presence(
                         status=discord.Status.do_not_disturb
@@ -724,6 +1150,48 @@ class music_cog(commands.Cog):
             except Exception:
                 pass
             traceback.print_exc()
+
+    async def related_song(
+        self, song: SongInfo, skip_urls: set
+    ) -> Optional[SongInfo]:
+        """YouTube search on the last title; skip that video and recent plays."""
+        info = await self._extract(f"ytsearch5:{song.title}")
+        entries = [entry for entry in ((info or {}).get("entries") or []) if entry]
+        picked = pick_related_entry(entries, song.url, skip_urls)
+        if not picked:
+            return None
+        page = picked.get("webpage_url") or ""
+        if not page.startswith("http"):
+            return None
+        stream = picked.get("url") or ""
+        if not stream or stream_url_stale(stream, time.time()):
+            try:
+                full = await self._extract(page)
+            except Exception as e:
+                print(f"autoplay extract failed: {e}")
+                return None
+            if not full or full.get("_type") == "playlist":
+                return None
+            picked = full
+        related = self.create_song_info(picked, page, None)
+        related.requester_name = "Autoplay"
+        return related
+
+    async def _songs_from_tracks(self, tracks: list, requester) -> list:
+        songs = []
+        for track in tracks:
+            url = (track or {}).get("url") or ""
+            if not url.startswith("http"):
+                continue
+            try:
+                info = await self._extract(url)
+            except Exception as e:
+                print(f"playlist extract failed: {e}")
+                continue
+            if not info or info.get("_type") == "playlist":
+                continue
+            songs.append(self.create_song_info(info, url, requester))
+        return songs
 
     async def resolve_source(self, query: str) -> Optional[str]:
         """Resolve a search query or URL to a playable webpage URL."""
@@ -852,8 +1320,6 @@ class music_cog(commands.Cog):
                     if thumbnail:
                         embed.set_thumbnail(url=thumbnail)
                     embed.set_footer(text=f'Playlist length: {len(entries)}')
-                    await interaction.followup.send(embed=embed)
-                    responded = True
 
                     for entry in entries:
                         song = self.create_song_info(
@@ -861,13 +1327,22 @@ class music_cog(commands.Cog):
                         )
                         queue.add(song)
 
-                    if not voice.is_playing() and not voice.is_paused():
-                        song = queue.pop_next()
-                        if song:
-                            await self.client.change_presence(
-                                activity=discord.Game(name=song.title)
-                            )
-                            await self.begin_playback(voice, song, interaction)
+                    starting = not voice.is_playing() and not voice.is_paused()
+                    started = queue.pop_next() if starting else None
+
+                    await interaction.followup.send(
+                        embed=embed,
+                        view=QueueControlView(
+                            self, interaction.guild_id, show_queue_button=True
+                        ),
+                    )
+                    responded = True
+
+                    if started:
+                        await self.client.change_presence(
+                            activity=discord.Game(name=started.title)
+                        )
+                        await self.begin_playback(voice, started, interaction)
                     else:
                         self.schedule_preload(interaction.guild_id)
                 else:
@@ -878,7 +1353,10 @@ class music_cog(commands.Cog):
                         await interaction.followup.send(
                             embed=self.song_embed(
                                 song, interaction, "Now Playing..."
-                            )
+                            ),
+                            view=QueueControlView(
+                                self, interaction.guild_id, show_queue_button=True
+                            ),
                         )
                         responded = True
                         await self.client.change_presence(
@@ -995,7 +1473,12 @@ class music_cog(commands.Cog):
         )
         if song.thumbnail:
             embed.set_thumbnail(url=song.thumbnail)
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(
+            embed=embed,
+            view=QueueControlView(
+                self, interaction.guild_id, show_queue_button=True
+            ),
+        )
 
     @app_commands.command(name="volume", description="Show or set volume (0-100) for this voice channel")
     @app_commands.describe(level="Volume 0-100; omit to show current")
@@ -1175,22 +1658,147 @@ class music_cog(commands.Cog):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ):
-        if before.channel and len(before.channel.members) == 1:
-            voice_client = discord.utils.get(
-                self.client.voice_clients,
-                guild=before.channel.guild,
-            )
-            if voice_client and voice_client.channel == before.channel:
-                queue = self.get_queue(before.channel.guild.id)
-                queue.clear()
-                await voice_client.disconnect()
-                await self.client.change_presence(status=discord.Status.do_not_disturb)
+        # Alone in the bot's channel: wait IDLE_LEAVE_SECONDS, then disconnect.
+        # Someone joining that channel cancels the wait.
+        guild = member.guild
+        if guild is None:
+            return
+        voice = guild.voice_client
+        if not voice or not voice.channel:
+            self._cancel_idle(guild.id)
+            return
+        channel = voice.channel
+        involved = (
+            before.channel is not None and before.channel.id == channel.id
+        ) or (after.channel is not None and after.channel.id == channel.id)
+        if not involved:
+            return
+        if len(channel.members) > 1:
+            self._cancel_idle(guild.id)
+        else:
+            self._schedule_idle(guild.id, channel.id)
 
-                general_channel = self.find_general_channel(before.channel.guild)
-                if general_channel:
-                    await general_channel.send(
-                        "I'm alone here, leaving the voice channel. Yare Yare..."
-                    )
+    @playlist.command(name="save", description="Save the current queue under a name")
+    @app_commands.describe(name="Playlist name")
+    async def playlist_save(self, interaction: discord.Interaction, name: str):
+        if err := self.same_vc_error(interaction):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        tracks = tracks_from_queue(self.get_queue(interaction.guild_id))
+        error = self.library.save_playlist(interaction.guild_id, name, tracks)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        self.library.save(library_path())
+        saved = self.library.get_playlist(interaction.guild_id, name)
+        label = saved["name"] if saved else name.strip()
+        await interaction.response.send_message(
+            f"Saved **{label}** ({len(tracks)} songs). Yare Yare..."
+        )
+
+    @playlist.command(name="play", description="Add a saved playlist onto the queue")
+    @app_commands.describe(name="Playlist name")
+    async def playlist_play(self, interaction: discord.Interaction, name: str):
+        await interaction.response.defer()
+        if not interaction.user.voice:
+            await interaction.followup.send(
+                "Get in a voice channel first, Teme.", ephemeral=True
+            )
+            return
+        saved = self.library.get_playlist(interaction.guild_id, name)
+        tracks = (saved or {}).get("tracks") or []
+        if not saved or not tracks:
+            await interaction.followup.send(
+                "No playlist with that name, Teme.", ephemeral=True
+            )
+            return
+
+        songs = await self._songs_from_tracks(tracks, interaction.user)
+        if not songs:
+            await interaction.followup.send("Can't play that playlist, Teme.")
+            return
+
+        channel = interaction.user.voice.channel
+        started = None
+        try:
+            lock = self.get_guild_lock(interaction.guild_id)
+            async with lock:
+                voice = discord.utils.get(
+                    self.client.voice_clients, guild=interaction.guild
+                )
+                if not voice or not voice.is_connected():
+                    voice = await channel.connect()
+                queue = self.get_queue(interaction.guild_id)
+                starting = not voice.is_playing() and not voice.is_paused()
+                for song in songs:
+                    queue.add(song)
+                started = queue.pop_next() if starting else None
+                if started:
+                    try:
+                        await self.client.change_presence(
+                            activity=discord.Game(name=started.title)
+                        )
+                    except Exception as e:
+                        print(f"playlist presence failed: {e}")
+                    await self.begin_playback(voice, started, interaction)
+                else:
+                    self.schedule_preload(interaction.guild_id)
+        except Exception as e:
+            print(f"playlist play failed: {e}")
+            await interaction.followup.send("Can't play that playlist, Teme.")
+            return
+
+        skipped = len(tracks) - len(songs)
+        label = saved.get("name") or name.strip()
+        if started:
+            await interaction.followup.send(
+                embed=self.song_embed(started, interaction, "Now Playing..."),
+                view=QueueControlView(
+                    self, interaction.guild_id, show_queue_button=True
+                ),
+            )
+            if len(songs) > 1 or skipped:
+                extra = f"Queued {len(songs) - 1} more from **{label}**."
+                if skipped:
+                    extra += f" Skipped {skipped}."
+                await interaction.followup.send(extra)
+            return
+
+        text = f"Added {len(songs)} songs from **{label}**. Yare Yare..."
+        if skipped:
+            text += f" Skipped {skipped}."
+        await interaction.followup.send(text)
+
+    @playlist.command(name="list", description="List saved playlists")
+    async def playlist_list(self, interaction: discord.Interaction):
+        items = self.library.list_playlists(interaction.guild_id)
+        if not items:
+            await interaction.response.send_message(
+                "No playlists saved, Teme.", ephemeral=True
+            )
+            return
+        lines = [
+            f"**{item.get('name', '?')}** — {len(item.get('tracks') or [])} songs"
+            for item in items
+        ]
+        await interaction.response.send_message("\n".join(lines)[:2000])
+
+    @playlist.command(name="delete", description="Delete a saved playlist")
+    @app_commands.describe(name="Playlist name")
+    async def playlist_delete(self, interaction: discord.Interaction, name: str):
+        if not (name or "").strip():
+            await interaction.response.send_message(
+                "Give the playlist a name, Teme.", ephemeral=True
+            )
+            return
+        existing = self.library.get_playlist(interaction.guild_id, name)
+        if not existing or not self.library.delete_playlist(interaction.guild_id, name):
+            await interaction.response.send_message(
+                "No playlist with that name, Teme.", ephemeral=True
+            )
+            return
+        self.library.save(library_path())
+        await interaction.response.send_message(f"Deleted **{existing.get('name', name)}**.")
 
     @app_commands.command(name="localplay", description="Play a local mp3")
     async def localplay(self, interaction: discord.Interaction, filename: str):
@@ -1222,7 +1830,12 @@ class music_cog(commands.Cog):
                 source,
                 after=lambda x=None: self.after_play(interaction),
             )
-            await interaction.followup.send(f"Now playing: {filename}")
+            await interaction.followup.send(
+                f"Now playing: {filename}",
+                view=QueueControlView(
+                    self, interaction.guild_id, show_queue_button=True
+                ),
+            )
         except Exception as e:
             await interaction.followup.send(f"Error playing {filename}: {e}")
 
