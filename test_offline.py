@@ -1,15 +1,27 @@
 """Offline self-checks. Run: python test_offline.py"""
+import os
+
+os.environ.setdefault("DISCORD_TOKEN", "dummy-token-for-offline-tests")  # config.py requires one
+
 import discord
 
-from dnd_cog import roll_dice_expr
+from admin_cog import HELP_SECTIONS, build_help_embed, help_command_names, admin_cog
+from dnd_cog import dnd_cog, roll_dice_expr
+from log_setup import resolve_level
+from ytdlp_check import age_days, parse_version_date
+from music_views import ReorderView
 from music_cog import (
     GuildLibrary,
     GuildQueue,
     IDLE_LEAVE_SECONDS,
     QueueControlView,
     SongInfo,
+    FFMPEG_BEFORE,
+    FFMPEG_OPTIONS,
+    YTDL_FORMAT,
     build_ffmpeg_options,
     clip_lines,
+    opus_bitrate,
     songs_from_tracks,
     track_from_flat_entry,
     tracks_from_flat_entries,
@@ -19,6 +31,11 @@ from music_cog import (
     pick_related_entry,
     stream_url_stale,
     tracks_from_queue,
+    PlayClock,
+    choose_audio_path,
+    info_is_opus,
+    should_reconnect,
+    ytdlp_failure_hint,
 )
 
 
@@ -175,6 +192,16 @@ def test_remove_seek_played():
     assert "-af" not in build_ffmpeg_options(base, "off")["options"]
     assert base == {"before_options": "-reconnect 1", "options": "-vn -bufsize 1M"}
 
+    assert YTDL_FORMAT.startswith("bestaudio[acodec=opus]/")
+    assert "-reconnect_streamed 1" in FFMPEG_BEFORE and "-vn" in FFMPEG_OPTIONS
+    default = {"before_options": FFMPEG_BEFORE, "options": FFMPEG_OPTIONS}
+    assert "-af" not in build_ffmpeg_options(default)["options"]
+    assert "alimiter" in build_ffmpeg_options(default, "bass")["options"]
+    assert opus_bitrate(None) == 128
+    assert opus_bitrate(64000) == 128
+    assert opus_bitrate(256000) == 256
+    assert opus_bitrate(384000) == 256
+
     for title in ["Old", "New"]:
         q.note_played(_song(title))
     assert [t for t, _ in q.played] == ["New", "Old"]
@@ -193,8 +220,12 @@ def test_remove_seek_played():
     assert q.played[0][0] == "S11"
 
 
-def _labels(view: QueueControlView) -> list[str]:
-    return [child.label for child in view.children if getattr(child, "label", None)]
+def _labels(view) -> list[str]:
+    return [
+        child.label or str(child.emoji)
+        for child in view.children
+        if isinstance(child, discord.ui.Button)
+    ]
 
 
 def test_queue_control_view_buttons():
@@ -214,38 +245,35 @@ def test_queue_control_view_buttons():
 
     cog = Cog()
     cog.q.current = _song("now")
+    pause = "\u23f8\ufe0f"
+    reorder = "Change song order"
     playing = QueueControlView(cog, 1, show_queue_button=True)
-    assert _labels(playing) == ["Pause", "Skip", "Stop", "Queue", "Autoplay: Off"]
+    assert _labels(playing) == [pause, "Next song", "Stop", "Queue", "Autoplay: Off", reorder]
+    assert playing.pause_btn.label is None
     assert playing.timeout == 180
     playing.to_components()
 
     cog.q.add(_song("next"))
     queued = QueueControlView(cog, 1)
-    assert _labels(queued) == [
-        "Move up",
-        "Move down",
-        "To front",
-        "Pause",
-        "Skip",
-        "Stop",
-        "Autoplay: Off",
-    ]
-    assert any(isinstance(child, discord.ui.Select) for child in queued.children)
+    assert _labels(queued) == [pause, "Next song", "Stop", "Autoplay: Off", reorder]
+    assert not any(isinstance(c, discord.ui.Select) for c in queued.children)
     queued.to_components()
 
     both = QueueControlView(cog, 1, show_queue_button=True)
-    assert _labels(both) == [
-        "Move up",
-        "Move down",
-        "To front",
-        "Pause",
-        "Skip",
-        "Stop",
-        "Queue",
-        "Autoplay: Off",
-    ]
+    assert _labels(both) == [pause, "Next song", "Stop", "Queue", "Autoplay: Off", reorder]
     both.to_components()
 
+    cog.q.add(_song("third"))
+    reorder_view = ReorderView(cog, 1)
+    assert _labels(reorder_view) == ["Move up", "Move down", "To front"]
+    selects = [c for c in reorder_view.children if isinstance(c, discord.ui.Select)]
+    assert len(selects) == 1 and len(selects[0].options) == 2
+    reorder_view.to_components()
+    cog.q.songs.clear()
+    reorder_view.selected = 2
+    reorder_view._rebuild_select()
+    assert reorder_view.selected == 1
+    assert not any(isinstance(c, discord.ui.Select) for c in reorder_view.children)
 
 def test_guild_library():
     assert IDLE_LEAVE_SECONDS == 60
@@ -450,7 +478,127 @@ def test_lazy_stream_resolve():
     asyncio.run(run())
 
 
+def test_audio_path_choice():
+    assert choose_audio_path(100, "off", 0, True) == "opus"
+    assert choose_audio_path(100, "off", 0, False) == "pcm"
+    assert choose_audio_path(80, "off", 0, True) == "pcm"
+    assert choose_audio_path(100, "bass", 0, True) == "pcm"
+    assert choose_audio_path(100, "nightcore", 0, True) == "pcm"
+    assert choose_audio_path(100, "off", 30, True) == "pcm"
+    assert choose_audio_path(0, "off", 0, True) == "pcm"
+    assert info_is_opus({"acodec": "opus"}) is True
+    assert info_is_opus({"acodec": "mp4a.40.2"}) is False
+    assert info_is_opus({}) is False and info_is_opus(None) is False
+
+
+def test_play_clock_and_reconnect_rule():
+    c = PlayClock()
+    assert c.position(now=5) == 0
+    c.start(10, now=100)
+    assert c.position(now=130) == 40
+    c.pause(now=130)
+    assert c.position(now=500) == 40  # frozen while paused
+    c.resume(now=200)
+    assert c.position(now=220) == 60
+    c.start(0, now=0)
+    assert c.position(now=3) == 3
+
+    assert should_reconnect(True, False, 2) is True
+    assert should_reconnect(False, False, 2) is False  # nothing was playing
+    assert should_reconnect(True, True, 2) is False  # deliberate stop
+    assert should_reconnect(True, False, 0) is False  # nobody listening
+
+    assert "pip install -U yt-dlp" in ytdlp_failure_hint("ERROR: Unable to extract nsig")
+    assert ytdlp_failure_hint("HTTP Error 403: Forbidden") != ""
+    assert ytdlp_failure_hint("Video unavailable") == ""
+    assert ytdlp_failure_hint("") == ""
+
+
+def test_saved_queue_roundtrip():
+    import json
+    import os
+    import tempfile
+
+    lib = GuildLibrary()
+    tracks = [{"title": "A", "url": "https://a", "thumbnail": ""}]
+    assert lib.get_saved_queue(1) is None
+    assert lib.clear_saved_queue(1) is False
+    lib.set_saved_queue(1, tracks, looping=True)
+    lib.set_saved_queue(2, [], looping=False)  # empty -> nothing saved
+    assert lib.get_saved_queue(2) is None
+    lib.save_playlist(1, "Mix", tracks)  # same bucket as playlists/autoplay
+    lib.toggle_autoplay(1)
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "library.json")
+        lib.save(path)
+        assert os.listdir(d) == ["library.json"]  # temp file replaced, none left behind
+        json.load(open(path, encoding="utf-8"))
+        loaded = GuildLibrary.load(path)
+        saved = loaded.get_saved_queue(1)
+        assert saved == {"tracks": tracks, "looping": True}
+        assert loaded.autoplay(1) is True
+        assert loaded.get_playlist(1, "mix") is not None
+
+        assert loaded.clear_saved_queue(1) is True
+        loaded.save(path)
+        assert GuildLibrary.load(path).get_saved_queue(1) is None
+        assert GuildLibrary.load(path).get_playlist(1, "mix") is not None
+
+        # a failed write must leave the old file intact and no temp litter
+        try:
+            GuildLibrary.write_atomic(os.path.join(d, "missing", "x.json"), "{}")
+        except OSError:
+            pass
+        assert os.listdir(d) == ["library.json"]
+
+    # malformed saved entry is ignored, not crashed on
+    bad = GuildLibrary({"1": {"queue": {"tracks": "nope"}}})
+    assert bad.get_saved_queue(1) is None
+
+    q = GuildQueue()
+    q.current = _song("now")
+    q.add(_song("next"))
+    rebuilt = songs_from_tracks(tracks_from_queue(q), {"before_options": "", "options": ""})
+    assert [s.title for s in rebuilt] == ["now", "next"]
+
+
+def test_logging_and_ytdlp_age():
+    import datetime
+    import logging
+
+    assert resolve_level("debug") == logging.DEBUG
+    assert resolve_level(" WARNING ") == logging.WARNING
+    assert resolve_level("") == logging.INFO
+    assert resolve_level("nonsense") == logging.INFO
+    assert parse_version_date("2026.08.19") == datetime.date(2026, 8, 19)
+    assert parse_version_date("2026.08.19.1") == datetime.date(2026, 8, 19)
+    assert parse_version_date("garbage") is None
+    assert age_days("2026.08.19", datetime.date(2026, 10, 10)) == 52
+    assert age_days("nope", datetime.date(2026, 10, 10)) is None
+
+
+def test_help_matches_commands():
+    actual = set()
+    for cog in (music_cog, dnd_cog, admin_cog):
+        for cmd in cog.__cog_app_commands__:
+            subs = getattr(cmd, "commands", None)
+            if subs:
+                actual.update(f"{cmd.name} {sub.name}" for sub in subs)
+            else:
+                actual.add(cmd.name)
+    assert help_command_names() == actual, help_command_names() ^ actual
+    embed = build_help_embed()
+    assert [f.name for f in embed.fields] == list(HELP_SECTIONS)
+    assert all(len(f.value) <= 1024 for f in embed.fields)
+
+
 if __name__ == "__main__":
+    test_logging_and_ytdlp_age()
+    test_help_matches_commands()
+    test_audio_path_choice()
+    test_play_clock_and_reconnect_rule()
+    test_saved_queue_roundtrip()
     test_flat_playlist_to_songs()
     test_lazy_stream_resolve()
     test_roll_dice_expr()

@@ -1,6 +1,11 @@
 import asyncio
+import logging
 import os
 import sys
+
+from log_setup import setup_logging
+
+setup_logging()
 
 import discord
 from discord.ext import commands
@@ -9,6 +14,9 @@ from admin_cog import admin_cog, sync_app_commands
 from config import TOKEN
 from dnd_cog import dnd_cog
 from music_cog import music_cog
+from ytdlp_check import check_ytdlp
+
+log = logging.getLogger("jotaro.main")
 
 # Override via BUILD_ID / GIT_COMMIT env so TrueNAS logs prove which image is running.
 MUSIC_BUILD = os.environ.get("BUILD_ID") or os.environ.get("GIT_COMMIT") or "2026-10-08-queue-tools"
@@ -24,8 +32,9 @@ if sys.platform == 'win32':
 
 @client.event
 async def on_ready():
-    print(f"Logged in as {client.user.name} ({client.user.id})")
-    print(f"MUSIC_BUILD={MUSIC_BUILD}")
+    log.info("Logged in as %s (%s)", client.user.name, client.user.id)
+    log.info("MUSIC_BUILD=%s", MUSIC_BUILD)
+    await asyncio.to_thread(check_ytdlp)
     await client.change_presence(status=discord.Status.do_not_disturb)
 
     for name, cog in (
@@ -35,18 +44,19 @@ async def on_ready():
     ):
         try:
             await client.add_cog(cog(client))
-            print(f"Loaded cog: {name}")
+            log.info("Loaded cog: %s", name)
         except Exception as e:
-            print(f"Failed to load {name}: {e}")
+            log.error("Failed to load %s: %s", name, e)
 
     try:
         await sync_app_commands(client)
     except (discord.errors.Forbidden, discord.HTTPException) as e:
-        print(f"Error syncing commands: {e}")
+        log.error("Error syncing commands: %s", e)
 
-    print('Yare Yare Daze...')
-    print("----------------------------------------")
+    log.info('Yare Yare Daze...')
+    log.info("----------------------------------------")
 
 
 if __name__ == "__main__":
-    client.run(TOKEN)
+    # setup_logging() owns handlers; discord.py would otherwise add a second stream handler.
+    client.run(TOKEN, log_handler=None)

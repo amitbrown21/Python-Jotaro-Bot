@@ -1,7 +1,10 @@
+import logging
 import os
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+log = logging.getLogger(__name__)
 
 # Docker/TrueNAS: mount host config dir to /config
 # Local: fall back to .env in the project folder
@@ -20,6 +23,7 @@ try:
 except PermissionError as e:
     # Host mount root-owned/mode 700 — botuser cannot stat/read .env
     if not os.getenv('DISCORD_TOKEN'):
+        log.error(_TRUENAS_PERM_HINT)
         raise ValueError(_TRUENAS_PERM_HINT) from e
 
 TOKEN = os.getenv('DISCORD_TOKEN', '')
@@ -31,3 +35,4 @@ if _guild_ids_str:
     guild_ids = [int(gid.strip()) for gid in _guild_ids_str.split(',') if gid.strip()]
 else:
     guild_ids = []
+log.info("Configured for %d guild(s)", len(guild_ids))

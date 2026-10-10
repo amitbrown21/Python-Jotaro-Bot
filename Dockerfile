@@ -17,7 +17,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY --chown=botuser:botuser main.py config.py admin_cog.py dnd_cog.py music_cog.py ./
+# YouTube breaks old yt-dlp often. Always pull the newest release at build time, even when the
+# requirements layer is cached. Force a refresh with: docker build --build-arg YTDLP_REFRESH=$(date +%s) .
+ARG YTDLP_REFRESH=0
+RUN echo "yt-dlp refresh token: ${YTDLP_REFRESH}" \
+    && pip install --no-cache-dir -U yt-dlp \
+    && python -c "import yt_dlp.version as v; print('yt-dlp', v.__version__)"
+
+COPY --chown=botuser:botuser *.py ./
 RUN mkdir -p /app/.yt_cache && chown botuser:botuser /app/.yt_cache
 
 USER botuser

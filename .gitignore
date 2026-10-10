@@ -10,6 +10,10 @@ dist/
 .venv/
 venv/
 .env
+library.json
+volumes.json
+*.log
+logs/
 .idea/
 .yt_cache/
 ffmpeg.exe
