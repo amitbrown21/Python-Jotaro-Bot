@@ -14,6 +14,49 @@ PLAY_EMOJI = "\u25b6\ufe0f"
 REORDER_EMOJI = "\U0001f500"
 
 
+def build_playlist_options(entries: list) -> list:
+    """SelectOptions from (name, description) pairs."""
+    return [
+        discord.SelectOption(label=name[:100], value=name, description=desc[:100])
+        for name, desc in entries
+    ]
+
+
+class PlaylistPickView(discord.ui.View):
+    """Ephemeral dropdown of saved playlists; only the opener can use it."""
+
+    def __init__(self, cog: "music_cog", user_id: int, entries: list):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.user_id = user_id
+        select = discord.ui.Select(
+            placeholder="Pick a playlist to play...",
+            options=build_playlist_options(entries),
+            min_values=1,
+            max_values=1,
+        )
+
+        async def on_select(interaction: discord.Interaction):
+            if interaction.user.id != self.user_id:
+                await interaction.response.send_message(
+                    "That menu isn't yours, Teme.", ephemeral=True
+                )
+                return
+            name = select.values[0]
+            await interaction.response.defer()
+            try:
+                await interaction.edit_original_response(
+                    content=f"Loading **{name}**...", view=None
+                )
+            except Exception as e:
+                log.warning("playlist picker edit failed: %s", e)
+            self.stop()
+            await self.cog.play_saved_playlist(interaction, name)
+
+        select.callback = on_select
+        self.add_item(select)
+
+
 class ReorderView(discord.ui.View):
     """Ephemeral picker for moving pending songs up, down, or to the front."""
 

@@ -269,6 +269,52 @@ class GuildLibrary:
         return items
 
 
+MAX_PICKER_ENTRIES = 25  # Discord cap for select options and autocomplete choices
+
+
+def _playlist_size(item: dict) -> int:
+    return len(item.get("tracks") or [])
+
+
+def _song_count_text(count: int) -> str:
+    return f"{count} song" if count == 1 else f"{count} songs"
+
+
+def filter_playlist_choices(
+    playlists: list, current: str, limit: int = MAX_PICKER_ENTRIES
+) -> list:
+    """(label, value) pairs for autocomplete: case-insensitive substring match,
+    prefix matches first, then alphabetical; value is the exact playlist name."""
+    needle = (current or "").strip().lower()
+    prefix, rest = [], []
+    for item in playlists:
+        name = str(item.get("name") or "").strip()
+        if not name or len(name) > 100:
+            continue
+        low = name.lower()
+        if needle and needle not in low:
+            continue
+        entry = (low, name, _playlist_size(item))
+        (prefix if low.startswith(needle) else rest).append(entry)
+    ordered = sorted(prefix) + sorted(rest)
+    return [
+        (f"{name} ({_song_count_text(count)})"[:100], name)
+        for _, name, count in ordered[:limit]
+    ]
+
+
+def playlist_picker_entries(
+    playlists: list, limit: int = MAX_PICKER_ENTRIES
+) -> tuple:
+    """((name, description) for the first `limit` playlists, total usable count)."""
+    usable = [
+        (str(item.get("name")).strip(), _song_count_text(_playlist_size(item)))
+        for item in playlists
+        if str(item.get("name") or "").strip() and len(str(item.get("name")).strip()) <= 100
+    ]
+    return usable[:limit], len(usable)
+
+
 class SongInfo:
     """Represents a song in the queue with lazy audio loading."""
 

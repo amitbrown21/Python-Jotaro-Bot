@@ -593,7 +593,38 @@ def test_help_matches_commands():
     assert all(len(f.value) <= 1024 for f in embed.fields)
 
 
+def test_playlist_picker_helpers():
+    from music_store import filter_playlist_choices, playlist_picker_entries
+    from music_views import build_playlist_options
+
+    lib = [
+        {"name": "Late Night", "tracks": [1] * 12},
+        {"name": "night", "tracks": [1] * 12},
+        {"name": "Rock", "tracks": [1]},
+        {"name": "Nightcore", "tracks": []},
+    ]
+    got = filter_playlist_choices(lib, "NIGHT")
+    # prefix matches first (alphabetical), then substring matches
+    assert [v for _, v in got] == ["night", "Nightcore", "Late Night"]
+    assert got[0][0] == "night (12 songs)"
+    assert filter_playlist_choices(lib, "rock")[0][0] == "Rock (1 song)"
+    assert len(filter_playlist_choices(lib, "")) == 4
+    assert filter_playlist_choices(lib, "zzz") == []
+    assert filter_playlist_choices([], "x") == []
+    many = [{"name": f"p{i:02d}", "tracks": []} for i in range(40)]
+    assert len(filter_playlist_choices(many, "p")) == 25
+    assert len(filter_playlist_choices(many, "", limit=5)) == 5
+
+    entries, total = playlist_picker_entries(many)
+    assert len(entries) == 25 and total == 40
+    assert playlist_picker_entries([]) == ([], 0)
+    options = build_playlist_options(entries[:2])
+    assert options[0].label == "p00" and options[0].value == "p00"
+    assert options[0].description == "0 songs"
+
+
 if __name__ == "__main__":
+    test_playlist_picker_helpers()
     test_logging_and_ytdlp_age()
     test_help_matches_commands()
     test_audio_path_choice()

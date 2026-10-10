@@ -34,7 +34,9 @@ from music_store import (  # noqa: F401
     GuildQueue,
     SongInfo,
     clip_lines,
+    filter_playlist_choices,
     library_path,
+    playlist_picker_entries,
     pick_related_entry,
     songs_from_tracks,
     track_from_flat_entry,
@@ -45,7 +47,7 @@ from music_store import (  # noqa: F401
 )
 from music_playback import PlaybackMixin
 from music_sources import SourcesMixin
-from music_views import QueueControlView  # noqa: F401
+from music_views import PlaylistPickView, QueueControlView  # noqa: F401
 
 log = logging.getLogger(__name__)
 
@@ -776,6 +778,17 @@ class music_cog(PlaybackMixin, SourcesMixin, commands.Cog):
         else:
             self._schedule_idle(guild.id, channel.id)
 
+    async def _playlist_name_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ):
+        if not interaction.guild_id:
+            return []
+        items = self.library.list_playlists(interaction.guild_id)
+        return [
+            app_commands.Choice(name=label, value=value)
+            for label, value in filter_playlist_choices(items, current)
+        ]
+
     @playlist.command(name="save", description="Save the current queue under a name")
     @app_commands.describe(name="Playlist name")
     async def playlist_save(self, interaction: discord.Interaction, name: str):
@@ -795,9 +808,37 @@ class music_cog(PlaybackMixin, SourcesMixin, commands.Cog):
         )
 
     @playlist.command(name="play", description="Add a saved playlist onto the queue")
-    @app_commands.describe(name="Playlist name")
-    async def playlist_play(self, interaction: discord.Interaction, name: str):
-        await interaction.response.defer()
+    @app_commands.describe(name="Playlist name (leave empty to pick from a dropdown)")
+    @app_commands.autocomplete(name=_playlist_name_autocomplete)
+    async def playlist_play(
+        self, interaction: discord.Interaction, name: Optional[str] = None
+    ):
+        if not (name or "").strip():
+            items = self.library.list_playlists(interaction.guild_id) if interaction.guild_id else []
+            entries, total = playlist_picker_entries(items)
+            if not entries:
+                await interaction.response.send_message(
+                    "No playlists saved, Teme.", ephemeral=True
+                )
+                return
+            note = "Pick a playlist below, or run the command again and type a name to search."
+            if total > len(entries):
+                note = (
+                    f"Showing the first {len(entries)} of {total} playlists. "
+                    "Run the command again and type a name to search."
+                )
+            await interaction.response.send_message(
+                note,
+                view=PlaylistPickView(self, interaction.user.id, entries),
+                ephemeral=True,
+            )
+            return
+        await self.play_saved_playlist(interaction, name)
+
+    async def play_saved_playlist(self, interaction: discord.Interaction, name: str):
+        """Shared by /playlist play name:... and the dropdown (interaction not yet responded)."""
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         if not interaction.user.voice:
             await interaction.followup.send(
                 "Get in a voice channel first, Teme.", ephemeral=True
@@ -977,6 +1018,7 @@ class music_cog(PlaybackMixin, SourcesMixin, commands.Cog):
 
     @playlist.command(name="delete", description="Delete a saved playlist")
     @app_commands.describe(name="Playlist name")
+    @app_commands.autocomplete(name=_playlist_name_autocomplete)
     async def playlist_delete(self, interaction: discord.Interaction, name: str):
         if not (name or "").strip():
             await interaction.response.send_message(
