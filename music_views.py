@@ -14,6 +14,20 @@ PLAY_EMOJI = "\u25b6\ufe0f"
 REORDER_EMOJI = "\U0001f500"
 
 
+async def report_error(interaction: discord.Interaction, error: Exception, *_):
+    """Log, and tell the user instead of leaving 'This interaction failed' / no response."""
+    log.error("interaction failed: %s", error, exc_info=error)
+    try:
+        send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+        await send("Something broke, Teme. Try again.", ephemeral=True)
+    except Exception:
+        pass
+
+
+async def _view_on_error(self, interaction, error, item):
+    await report_error(interaction, error)
+
+
 def build_playlist_options(entries: list) -> list:
     """SelectOptions from (name, description) pairs."""
     return [
@@ -24,6 +38,8 @@ def build_playlist_options(entries: list) -> list:
 
 class PlaylistPickView(discord.ui.View):
     """Ephemeral dropdown of saved playlists; only the opener can use it."""
+
+    on_error = _view_on_error
 
     def __init__(self, cog: "music_cog", user_id: int, entries: list):
         super().__init__(timeout=180)
@@ -59,6 +75,8 @@ class PlaylistPickView(discord.ui.View):
 
 class ReorderView(discord.ui.View):
     """Ephemeral picker for moving pending songs up, down, or to the front."""
+
+    on_error = _view_on_error
 
     def __init__(self, cog: "music_cog", guild_id: int):
         super().__init__(timeout=180)
@@ -164,12 +182,17 @@ class ReorderView(discord.ui.View):
         await self._move(interaction, "front")
 
 
+_live_controls: dict = {}  # (guild_id, is_now_playing) -> newest QueueControlView
+
+
 class QueueControlView(discord.ui.View):
     """Playback controls for the now-playing and queue messages.
 
-    Buttons listen for 180 seconds, then Discord stops dispatching them.
-    Run /queue or /nowplaying again (or start another song) for a fresh row.
+    No timeout, so they work while paused. A newer message of the same kind replaces the
+    old one's buttons. Not persistent across bot restarts (no custom_id).
     """
+
+    on_error = _view_on_error
 
     def __init__(
         self,
@@ -178,9 +201,14 @@ class QueueControlView(discord.ui.View):
         *,
         show_queue_button: bool = False,
     ):
-        super().__init__(timeout=180)
+        super().__init__(timeout=None)  # paused songs sit for minutes; buttons must not expire
         self.cog = cog
         self.guild_id = guild_id
+        # timeout=None views live forever, so a newer message of the same kind retires the old one
+        old = _live_controls.get((guild_id, show_queue_button))
+        if old:
+            old.stop()
+        _live_controls[(guild_id, show_queue_button)] = self
         if not show_queue_button:
             self.remove_item(self.queue_btn)
         self._sync_pause_label()
@@ -217,8 +245,7 @@ class QueueControlView(discord.ui.View):
             self.cog.get_queue(self.guild_id).clock.pause()
             text = "Paused, Baka Yaro"
         elif voice and voice.is_paused():
-            voice.resume()
-            self.cog.get_queue(self.guild_id).clock.resume()
+            self.cog.resume_playback(voice, interaction)
             text = "Resuming..."
         else:
             await interaction.response.send_message(

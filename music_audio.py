@@ -91,6 +91,12 @@ def should_reconnect(was_playing: bool, stopping: bool, humans_in_channel: int) 
     return bool(was_playing) and not stopping and humans_in_channel > 0
 
 
+def should_advance(paused: bool, skipping: bool) -> bool:
+    """A paused player never reads its source, so it cannot end naturally. An after-callback
+    while paused means the voice client died (disconnect/stop): do not burn the next song."""
+    return skipping or not paused
+
+
 _STALE_YTDLP_HINTS = (
     "unable to extract",
     "sign in to confirm",

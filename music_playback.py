@@ -1,6 +1,7 @@
 """Playback engine: audio path choice, play/advance/retry, voice reconnect. Mixed into music_cog."""
 import asyncio
 import logging
+import time
 from typing import Optional
 
 import discord
@@ -12,6 +13,7 @@ from music_audio import (
     build_ffmpeg_options,
     choose_audio_path,
     opus_bitrate,
+    should_advance,
     should_reconnect,
     ytdlp_failure_hint,
 )
@@ -70,6 +72,14 @@ class PlaybackMixin:
             queue.clock.pause()
         return True
 
+    def resume_playback(self, voice: discord.VoiceClient, interaction: discord.Interaction):
+        """Resume; after a long pause the HTTP stream is likely dead, so rebuild at the saved spot."""
+        clock = self.get_queue(interaction.guild_id).clock
+        if clock.paused_at is not None and time.monotonic() - clock.paused_at > 60:
+            self.restart_current(voice, interaction, seek=clock.position())  # stays paused
+        voice.resume()
+        clock.resume()
+
     async def _announce(self, interaction: discord.Interaction, *args, **kwargs):
         """Best-effort announce; interaction followups expire (~15m) and must not block play."""
         try:
@@ -106,6 +116,8 @@ class PlaybackMixin:
             queue.stopping = False
             queue.skipping = False
             return
+        if not should_advance(queue.clock.paused_at is not None, queue.skipping):
+            return  # paused player died (voice drop): reconnect/resume handles it, stay put
         if (
             error
             and song is not None
@@ -165,7 +177,8 @@ class PlaybackMixin:
         if queue.current is not song or queue.stopping or queue.skipping:
             return
         try:
-            self.play_audio(voice, song, interaction)
+            # resume where it died (long pause / mid-stream drop), not from 0:00
+            self.play_audio(voice, song, interaction, seek=queue.clock.position())
             self.schedule_preload(interaction.guild_id)
         except Exception as e:
             log.warning("retry playback failed: %s", e)
@@ -193,6 +206,8 @@ class PlaybackMixin:
                 if not voice or not voice.is_connected():
                     # dropped/disconnected: leave the queue intact (reconnect path resumes it)
                     return
+                if voice.is_playing() or voice.is_paused():
+                    return  # a newer song already took over (late after-callback); never double-play
 
                 finished = queue.current
                 song = queue.pop_next()
@@ -320,9 +335,12 @@ class PlaybackMixin:
         )
         self._reconnecting.add(gid)
         queue.play_gen += 1  # ignore the dead player's after-callback
-        asyncio.create_task(self._reconnect_voice(guild, channel, song, elapsed))
+        paused = queue.clock.paused_at is not None
+        asyncio.create_task(self._reconnect_voice(guild, channel, song, elapsed, paused))
 
-    async def _reconnect_voice(self, guild, channel, song: SongInfo, position: int):
+    async def _reconnect_voice(
+        self, guild, channel, song: SongInfo, position: int, paused: bool = False
+    ):
         gid = guild.id
         queue = self.get_queue(gid)
         interaction = self._last_interaction.get(gid)
@@ -343,6 +361,9 @@ class PlaybackMixin:
                     if not song.audio_url:
                         raise RuntimeError("no stream to resume")
                     self.play_audio(voice, song, interaction, seek=position)
+                    if paused:
+                        voice.pause()
+                        queue.clock.pause()
                     log.info("Voice reconnected in guild %s (attempt %d); resumed %r at %ss",
                              gid, attempt, song.title, position)
                     await self._announce(interaction, "Got disconnected, I'm back. Yare Yare...")

@@ -23,6 +23,7 @@ from music_audio import (  # noqa: F401  (re-exported: main.py and test_offline.
     info_is_opus,
     opus_bitrate,
     parse_seek,
+    should_advance,
     should_reconnect,
     stream_url_stale,
     ytdlp_failure_hint,
@@ -47,7 +48,7 @@ from music_store import (  # noqa: F401
 )
 from music_playback import PlaybackMixin
 from music_sources import SourcesMixin
-from music_views import PlaylistPickView, QueueControlView  # noqa: F401
+from music_views import PlaylistPickView, QueueControlView, report_error  # noqa: F401
 
 log = logging.getLogger(__name__)
 
@@ -114,19 +115,25 @@ class music_cog(PlaybackMixin, SourcesMixin, commands.Cog):
         self._guild_locks: Dict[int, asyncio.Lock] = {}
         self._extract_lock = asyncio.Lock()
 
+    async def cog_app_command_error(self, interaction: discord.Interaction, error):
+        await report_error(interaction, error)
+
     def _load_volumes(self) -> Dict[int, int]:
         path = volumes_path()
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             return {int(k): int(v) for k, v in data.items()}
-        except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
+        except (FileNotFoundError, ValueError, TypeError, AttributeError, OSError):
             return {}
 
     def _save_volumes(self):
         path = volumes_path()
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({str(k): v for k, v in self.volumes.items()}, f)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({str(k): v for k, v in self.volumes.items()}, f)
+        except OSError as e:  # read-only /config: keep the in-memory volume, don't fail the command
+            log.warning("Could not write %s: %s", path, e)
 
     def get_volume_percent(self, channel_id: int) -> int:
         return self.volumes.get(channel_id, 100)
@@ -161,6 +168,7 @@ class music_cog(PlaybackMixin, SourcesMixin, commands.Cog):
         self.library.set_saved_queue(
             guild_id, tracks_from_queue(queue), queue.looping
         )
+        self.library.set_history(guild_id, queue.played)
         self.save_library_soon()
 
     def clear_queue_state(self, guild_id: int):
@@ -202,8 +210,12 @@ class music_cog(PlaybackMixin, SourcesMixin, commands.Cog):
         if len(voice.channel.members) > 1:
             return
         queue = self.get_queue(guild_id)
-        queue.stopping = True
+        # only a live player fires after(); otherwise the flag would stay set and block the next song
+        queue.stopping = voice.is_playing() or voice.is_paused()
         self.clear_queue_state(guild_id)
+        # unregister first: the bot's own voice-state update calls _cancel_idle and would cancel this task mid-disconnect
+        self._idle_tasks.pop(guild_id, None)
+        self._idle_channel.pop(guild_id, None)
         await voice.disconnect()
         try:
             await self.client.change_presence(status=discord.Status.do_not_disturb)
@@ -214,8 +226,6 @@ class music_cog(PlaybackMixin, SourcesMixin, commands.Cog):
             await general_channel.send(
                 "I'm alone here, leaving the voice channel. Yare Yare..."
             )
-        self._idle_tasks.pop(guild_id, None)
-        self._idle_channel.pop(guild_id, None)
 
     def same_vc_error(self, interaction: discord.Interaction) -> Optional[str]:
         voice = interaction.guild.voice_client if interaction.guild else None
@@ -231,6 +241,7 @@ class music_cog(PlaybackMixin, SourcesMixin, commands.Cog):
     def get_queue(self, guild_id: int) -> GuildQueue:
         if guild_id not in self.queues:
             self.queues[guild_id] = GuildQueue()
+            self.queues[guild_id].played = self.library.get_history(guild_id)
         return self.queues[guild_id]
 
     def get_guild_lock(self, guild_id: int) -> asyncio.Lock:
@@ -429,19 +440,29 @@ class music_cog(PlaybackMixin, SourcesMixin, commands.Cog):
 
                     if not voice.is_playing() and not voice.is_paused():
                         queue.current = song
-                        await interaction.followup.send(
-                            embed=self.song_embed(
-                                song, interaction, "Now Playing..."
-                            ),
-                            view=QueueControlView(
-                                self, interaction.guild_id, show_queue_button=True
-                            ),
-                        )
-                        responded = True
-                        await self.client.change_presence(
-                            activity=discord.Game(name=song.title)
-                        )
-                        await self.begin_playback(voice, song, interaction)
+                        try:
+                            await self.client.change_presence(
+                                activity=discord.Game(name=song.title)
+                            )
+                            await self.begin_playback(voice, song, interaction)
+                        except Exception as e:
+                            # dead stream: don't leave it as "current" with queued songs stuck behind it
+                            log.warning("play first track failed: %s", e)
+                            await interaction.followup.send(
+                                f"Can't load **{song.title}**, skipping it, Teme."
+                            )
+                            responded = True
+                            first_failed = True
+                        else:
+                            await interaction.followup.send(
+                                embed=self.song_embed(
+                                    song, interaction, "Now Playing..."
+                                ),
+                                view=QueueControlView(
+                                    self, interaction.guild_id, show_queue_button=True
+                                ),
+                            )
+                            responded = True
                     else:
                         position = queue.add(song)
                         self.persist_queue(interaction.guild_id)
@@ -491,8 +512,7 @@ class music_cog(PlaybackMixin, SourcesMixin, commands.Cog):
     async def resume(self, interaction: discord.Interaction):
         voice = discord.utils.get(self.client.voice_clients, guild=interaction.guild)
         if voice and voice.is_paused():
-            voice.resume()
-            self.get_queue(interaction.guild_id).clock.resume()
+            self.resume_playback(voice, interaction)
             await interaction.response.send_message("Resuming...")
         else:
             await interaction.response.send_message("No song is paused, Teme")
@@ -800,7 +820,7 @@ class music_cog(PlaybackMixin, SourcesMixin, commands.Cog):
         if error:
             await interaction.response.send_message(error, ephemeral=True)
             return
-        self.library.save(library_path())
+        self.save_library_soon()
         saved = self.library.get_playlist(interaction.guild_id, name)
         label = saved["name"] if saved else name.strip()
         await interaction.response.send_message(
@@ -1031,7 +1051,7 @@ class music_cog(PlaybackMixin, SourcesMixin, commands.Cog):
                 "No playlist with that name, Teme.", ephemeral=True
             )
             return
-        self.library.save(library_path())
+        self.save_library_soon()
         await interaction.response.send_message(f"Deleted **{existing.get('name', name)}**.")
 
     @app_commands.command(name="localplay", description="Play a local mp3")
@@ -1044,16 +1064,16 @@ class music_cog(PlaybackMixin, SourcesMixin, commands.Cog):
             )
             return
 
+        song_path = f"{filename}.mp3"
+        if os.path.basename(filename) != filename or not os.path.exists(song_path):
+            await interaction.followup.send(f"File not found: {song_path}")
+            return
+
         channel = interaction.user.voice.channel
         voice = discord.utils.get(self.client.voice_clients, guild=interaction.guild)
 
         if not voice or not voice.is_connected():
             voice = await channel.connect()
-
-        song_path = f"{filename}.mp3"
-        if not os.path.exists(song_path):
-            await interaction.followup.send(f"File not found: {song_path}")
-            return
 
         try:
             vol = self.get_volume_percent(voice.channel.id) / 100.0

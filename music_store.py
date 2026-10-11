@@ -77,6 +77,7 @@ def tracks_from_queue(queue: "GuildQueue") -> list:
 
 
 MAX_PLAYLIST_ENTRIES = 200
+MAX_HISTORY = 10  # recently played kept per guild (memory and library.json)
 
 
 MAX_PLAY_FAILURES = 20  # consecutive unplayable songs skipped before play_next gives up
@@ -161,9 +162,17 @@ class GuildLibrary:
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+        except (FileNotFoundError, OSError):
             return cls()
-        return cls(data if isinstance(data, dict) else {})
+        except ValueError:  # bad JSON / bad encoding: keep the file as .bak, the next save would overwrite it
+            data = None
+        if not isinstance(data, dict):
+            try:
+                os.replace(path, path + ".bak")
+            except OSError:
+                pass
+            return cls()
+        return cls(data)
 
     def dumps(self) -> str:
         return json.dumps(self.guilds)
@@ -208,6 +217,19 @@ class GuildLibrary:
             del bucket["queue"]
             return True
         return False
+
+    def set_history(self, guild_id: int, played: list):
+        self._bucket(guild_id)["history"] = [[t, u] for t, u in played[:MAX_HISTORY]]
+
+    def get_history(self, guild_id: int) -> list:
+        """[(title, url)] newest first; tolerates a missing or malformed key."""
+        bucket = self.guilds.get(str(guild_id))
+        raw = bucket.get("history") if isinstance(bucket, dict) else None
+        out = []
+        for item in raw if isinstance(raw, list) else []:
+            if isinstance(item, (list, tuple)) and len(item) == 2 and all(isinstance(x, str) for x in item):
+                out.append((item[0], item[1]))
+        return out[:MAX_HISTORY]
 
     def _bucket(self, guild_id: int) -> dict:
         key = str(guild_id)
@@ -399,7 +421,7 @@ class GuildQueue:
 
     def note_played(self, song: SongInfo):
         self.played.insert(0, (song.title, song.url))
-        del self.played[10:]
+        del self.played[MAX_HISTORY:]
 
     def requeue_played(self, index: int, ffmpeg_options: dict) -> Optional[SongInfo]:
         """1 = most recent. Append a copy onto the pending queue."""

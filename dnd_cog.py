@@ -6,15 +6,18 @@ from discord import app_commands
 from discord.ext import commands
 
 
+MAX_ROLL_TOKENS, MAX_ROLL_DICE, MAX_ROLL_SIDES = 10, 100, 1_000_000
+
+
 def roll_dice_expr(dice: str) -> Tuple[List[str], int]:
     """Parse space-separated NdM tokens. Returns (lines, total of valid rolls)."""
     results: List[str] = []
     total = 0
 
-    for die in dice.split():
+    for die in dice.split()[:MAX_ROLL_TOKENS]:
         try:
             num_dice, die_size = map(int, die.lower().split('d'))
-            if num_dice < 1 or die_size < 1:
+            if not (1 <= num_dice <= MAX_ROLL_DICE and 1 <= die_size <= MAX_ROLL_SIDES):
                 raise ValueError
             rolls = [random.randint(1, die_size) for _ in range(num_dice)]
             result_sum = sum(rolls)
@@ -37,7 +40,7 @@ class dnd_cog(commands.Cog):
         response = "\n".join(results)
         if len(dice.split()) > 1:
             response += f"\nTotal: {total}"
-        await interaction.response.send_message(response)
+        await interaction.response.send_message(response[:2000] or "Nothing to roll, Teme.")
 
     @app_commands.command(name="generate_stats", description="Generate character stats using various methods")
     @app_commands.describe(method="Stat generation method")

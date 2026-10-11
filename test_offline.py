@@ -1,5 +1,6 @@
 """Offline self-checks. Run: python test_offline.py"""
 import os
+import tempfile
 
 os.environ.setdefault("DISCORD_TOKEN", "dummy-token-for-offline-tests")  # config.py requires one
 
@@ -35,6 +36,7 @@ from music_cog import (
     choose_audio_path,
     info_is_opus,
     should_reconnect,
+    should_advance,
     ytdlp_failure_hint,
 )
 
@@ -55,6 +57,35 @@ def test_roll_dice_expr():
 
     lines, total = roll_dice_expr("0d6")
     assert lines == ["Invalid input: 0d6"]
+
+    # huge counts/sides/tokens are rejected or capped, never rolled
+    lines, total = roll_dice_expr("99999999d6 1d99999999999 " + "1d6 " * 50)
+    assert lines[0].startswith("Invalid") and lines[1].startswith("Invalid")
+    assert len(lines) <= 10
+
+
+def test_corrupt_library_backed_up():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "library.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        assert GuildLibrary.load(path).guilds == {}
+        assert not os.path.exists(path) and os.path.exists(path + ".bak")
+
+
+def test_history_persists():
+    q = GuildQueue()
+    for i in range(15):
+        q.note_played(_song(f"H{i}"))
+    lib = GuildLibrary()
+    lib.set_history(7, q.played)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "library.json")
+        lib.save(path)
+        got = GuildLibrary.load(path).get_history(7)
+    assert got == q.played and len(got) == 10 and got[0][0] == "H14"
+    assert GuildLibrary({"7": {"autoplay": True}}).get_history(7) == []
+    assert GuildLibrary({"7": {"history": "junk"}}).get_history(7) == []
 
 
 def _song(title: str) -> SongInfo:
@@ -250,7 +281,7 @@ def test_queue_control_view_buttons():
     playing = QueueControlView(cog, 1, show_queue_button=True)
     assert _labels(playing) == [pause, "Next song", "Stop", "Queue", "Autoplay: Off", reorder]
     assert playing.pause_btn.label is None
-    assert playing.timeout == 180
+    assert playing.timeout is None  # buttons must outlive a long pause
     playing.to_components()
 
     cog.q.add(_song("next"))
@@ -508,6 +539,9 @@ def test_play_clock_and_reconnect_rule():
     assert should_reconnect(True, True, 2) is False  # deliberate stop
     assert should_reconnect(True, False, 0) is False  # nobody listening
 
+    assert should_advance(False, False) is True  # natural end
+    assert should_advance(True, False) is False  # paused player died: do not start next song
+    assert should_advance(True, True) is True  # explicit skip
     assert "pip install -U yt-dlp" in ytdlp_failure_hint("ERROR: Unable to extract nsig")
     assert ytdlp_failure_hint("HTTP Error 403: Forbidden") != ""
     assert ytdlp_failure_hint("Video unavailable") == ""
@@ -633,6 +667,8 @@ if __name__ == "__main__":
     test_flat_playlist_to_songs()
     test_lazy_stream_resolve()
     test_roll_dice_expr()
+    test_corrupt_library_backed_up()
+    test_history_persists()
     test_stream_url_stale()
     test_guild_queue()
     test_guild_queue_move_shuffle_loop()
