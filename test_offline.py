@@ -19,6 +19,7 @@ from music_cog import (
     SongInfo,
     FFMPEG_BEFORE,
     FFMPEG_OPTIONS,
+    USER_AGENT,
     YTDL_FORMAT,
     build_ffmpeg_options,
     clip_lines,
@@ -35,6 +36,7 @@ from music_cog import (
     PlayClock,
     should_reconnect,
     should_advance,
+    ytdl_client_options,
     ytdlp_failure_hint,
 )
 
@@ -525,6 +527,37 @@ def test_stream_buffering_options():
     # discord.py pins every decoded source to s16le/48kHz/stereo itself, so our
     # options only strip non-audio streams (no duplicate -ar/-ac warnings)
     assert FFMPEG_OPTIONS == "-vn -sn -dn"
+    # googlevideo answers ffmpeg's default "Lavf/.." UA with 403, so the media fetch
+    # must identify as the same browser yt-dlp extracted with.
+    assert f'-user_agent "{USER_AGENT}"' in FFMPEG_BEFORE
+    assert USER_AGENT.startswith("Mozilla/5.0")
+
+
+def test_ytdl_identity_and_403_escape_hatches():
+    """Both halves of a track must look like one browser, and the 403 escape hatches
+    must stay inert unless the env vars are set (a stray cookiefile path would break
+    every fetch)."""
+    keys = ("YTDLP_COOKIES", "YTDLP_PLAYER_CLIENT")
+    saved = {k: os.environ.pop(k, None) for k in keys}
+    try:
+        plain = ytdl_client_options()
+        assert plain == {"http_headers": {"User-Agent": USER_AGENT}}
+        # a blank variable is not an empty path / empty client list
+        os.environ["YTDLP_COOKIES"] = "   "
+        assert "cookiefile" not in ytdl_client_options()
+
+        os.environ["YTDLP_COOKIES"] = "  /config/cookies.txt  "
+        os.environ["YTDLP_PLAYER_CLIENT"] = "web_safari, tv"
+        tuned = ytdl_client_options()
+        assert tuned["cookiefile"] == "/config/cookies.txt"  # trimmed
+        assert tuned["extractor_args"] == {"youtube": {"player_client": ["web_safari", "tv"]}}
+        assert tuned["http_headers"]["User-Agent"] == USER_AGENT
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def test_play_audio_always_builds_pcm_volume_source():
@@ -742,6 +775,7 @@ if __name__ == "__main__":
     test_logging_and_ytdlp_age()
     test_help_matches_commands()
     test_stream_buffering_options()
+    test_ytdl_identity_and_403_escape_hatches()
     test_play_audio_always_builds_pcm_volume_source()
     test_play_clock_and_reconnect_rule()
     test_saved_queue_roundtrip()

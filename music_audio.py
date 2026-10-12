@@ -1,5 +1,7 @@
 """FFmpeg / yt-dlp audio helpers: sources, option builders, URL freshness, lyrics."""
 import json
+import logging
+import os
 import re
 import subprocess
 import time
@@ -8,6 +10,8 @@ import urllib.request
 from typing import Optional
 
 from discord import FFmpegPCMAudio, PCMVolumeTransformer
+
+log = logging.getLogger(__name__)
 
 _EXPIRE_RE = re.compile(r"[?&]expire=(\d+)")
 
@@ -28,6 +32,16 @@ def stream_url_stale(url: Optional[str], now: float) -> bool:
 YTDL_FORMAT = "bestaudio[acodec=opus]/bestaudio/best"
 
 
+# googlevideo fingerprints the HTTP client, and ffmpeg's default "Lavf/.." UA gets
+# answered with "HTTP error 403 Forbidden" (discord.py then reports FFmpeg exit code 8
+# and the track is skipped). Send the same browser UA yt-dlp extracts with, so the
+# extraction request and the media fetch look like one client.
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
 # Input-side read-ahead for HTTP (googlevideo). Reconnect keeps a dropped CDN
 # connection alive mid-song; a bounded rw_timeout (microseconds) makes a stalled
 # read fail fast so after_play's refresh+resume recovers instead of leaving long
@@ -36,6 +50,7 @@ YTDL_FORMAT = "bestaudio[acodec=opus]/bestaudio/best"
 # found") which aborts opening the stream. Do not add +nobuffer either — that
 # trades buffer for latency and is what makes Discord bots stutter.
 FFMPEG_BEFORE = (
+    f'-user_agent "{USER_AGENT}" '
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
     "-reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx "
     "-rw_timeout 8000000 -thread_queue_size 512 "
@@ -162,6 +177,30 @@ def build_ffmpeg_options(base: dict, effect: str = "off", seek: int = 0) -> dict
     if af:
         options = f"{options} -af {af}"
     return {"before_options": before, "options": options}
+
+
+def ytdl_client_options() -> dict:
+    """Client identity plus opt-in escape hatches for hosts YouTube answers with 403.
+
+    Always pins the browser UA so yt-dlp's extraction and the ffmpeg media fetch agree.
+    YTDLP_COOKIES points at a Netscape cookies.txt (the reliable fix once YouTube
+    blocks the host's IP) and YTDLP_PLAYER_CLIENT overrides the YouTube client, e.g.
+    "web_safari,tv". Both stay inert when unset, so a typo cannot poison every fetch.
+    """
+    opts = {"http_headers": {"User-Agent": USER_AGENT}}
+    cookies = os.getenv("YTDLP_COOKIES", "").strip()
+    if cookies:
+        opts["cookiefile"] = cookies
+        log.info("yt-dlp: using cookies from %s", cookies)
+    client = os.getenv("YTDLP_PLAYER_CLIENT", "").strip()
+    if client:
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": [c.strip() for c in client.split(",") if c.strip()]
+            }
+        }
+        log.info("yt-dlp: player_client=%s", client)
+    return opts
 
 
 def fetch_lyrics(title: str) -> str:

@@ -12,6 +12,7 @@ from discord.ext import commands
 from music_audio import (  # noqa: F401  (re-exported: main.py and test_offline.py import from here)
     FFMPEG_BEFORE,
     FFMPEG_OPTIONS,
+    USER_AGENT,
     YTDL_FORMAT,
     PlayClock,
     TrackAudio,
@@ -23,6 +24,7 @@ from music_audio import (  # noqa: F401  (re-exported: main.py and test_offline.
     should_advance,
     should_reconnect,
     stream_url_stale,
+    ytdl_client_options,
     ytdlp_failure_hint,
 )
 from music_store import (  # noqa: F401
@@ -91,6 +93,8 @@ class music_cog(PlaybackMixin, SourcesMixin, commands.Cog):
             'socket_timeout': 15,
             'retries': 3,
             'cachedir': os.path.join(os.path.dirname(__file__), '.yt_cache'),
+            # Shared browser UA, plus opt-in YTDLP_COOKIES / YTDLP_PLAYER_CLIENT.
+            **ytdl_client_options(),
         }
 
         self.ffmpeg_options = {

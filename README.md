@@ -18,6 +18,12 @@ Copy `.env.example` to `.env` (or put `.env` in a folder you mount at `/config`)
 |----------|----------|-------------|
 | `DISCORD_TOKEN` | Yes | Discord bot token |
 | `GUILD_IDS` | No | Comma-separated guild IDs for fast slash sync |
+| `YTDLP_COOKIES` | No | Netscape `cookies.txt` path; fixes YouTube `HTTP 403 Forbidden` on play |
+| `YTDLP_PLAYER_CLIENT` | No | Override the YouTube client (e.g. `web_safari,tv`) if 403s persist |
+
+If playback starts failing with `[https] HTTP error 403 Forbidden` / `FFmpeg exited with code 8`,
+YouTube is rejecting this host's IP — set `YTDLP_COOKIES` (export cookies from a logged-in
+browser while logged into YouTube) and redeploy.
 
 ## Docker (local)
 
