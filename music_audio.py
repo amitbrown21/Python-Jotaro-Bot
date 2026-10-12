@@ -7,7 +7,7 @@ import urllib.parse
 import urllib.request
 from typing import Optional
 
-from discord import FFmpegOpusAudio, FFmpegPCMAudio, PCMVolumeTransformer
+from discord import FFmpegPCMAudio, PCMVolumeTransformer
 
 _EXPIRE_RE = re.compile(r"[?&]expire=(\d+)")
 
@@ -28,13 +28,29 @@ def stream_url_stale(url: Optional[str], now: float) -> bool:
 YTDL_FORMAT = "bestaudio[acodec=opus]/bestaudio/best"
 
 
+# Input-side read-ahead for HTTP (googlevideo). Reconnect keeps a dropped CDN
+# connection alive mid-song; a bounded rw_timeout (microseconds) makes a stalled
+# read fail fast so after_play's refresh+resume recovers instead of leaving long
+# silence. -thread_queue_size is the demuxer read-ahead. Do NOT add -buffer_size:
+# it is a tcp/socket option, and http inputs reject it ("Option buffer_size not
+# found") which aborts opening the stream. Do not add +nobuffer either — that
+# trades buffer for latency and is what makes Discord bots stutter.
 FFMPEG_BEFORE = (
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+    "-reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx "
+    "-rw_timeout 8000000 -thread_queue_size 512 "
+    "-fflags +genpts+discardcorrupt "
     "-nostdin -probesize 1M -analyzeduration 1M"
 )
 
 
+# discord.py fixes the PCM output itself (-f s16le -ar 48000 -ac 2), which is what
+# pins a source at any sample rate to Discord's 48kHz — so we only strip non-audio
+# streams here and let -af effects get appended per play. Repeating -ar/-ac would
+# just make ffmpeg warn about duplicate options on every track.
 FFMPEG_OPTIONS = "-vn -sn -dn"
+
+PRELOAD_DEPTH = 2
 
 
 def opus_bitrate(channel_bitrate: Optional[int]) -> int:
@@ -43,16 +59,13 @@ def opus_bitrate(channel_bitrate: Optional[int]) -> int:
     return max(128, min(256, kbps))
 
 
-def info_is_opus(info: Optional[dict]) -> bool:
-    """True when yt-dlp resolved an Opus audio stream (acodec starts with 'opus')."""
-    return str((info or {}).get("acodec") or "").lower().startswith("opus")
-
-
-def choose_audio_path(volume_pct: int, effect: str, seek: int, is_opus: bool) -> str:
-    """'opus' = FFmpeg stream copy (no decode/re-encode); 'pcm' = decode + volume/effects."""
-    if is_opus and int(volume_pct) == 100 and (effect or "off") == "off" and not seek:
-        return "opus"
-    return "pcm"
+def songs_to_preload(songs, now: float, depth: int = PRELOAD_DEPTH) -> list:
+    """Upcoming queue entries whose stream URL is missing or expired."""
+    return [
+        song
+        for song in list(songs)[:depth]
+        if getattr(song, "url", None) and stream_url_stale(getattr(song, "audio_url", None), now)
+    ]
 
 
 class PlayClock:
@@ -209,13 +222,6 @@ class _StrictExitMixin:
 
 class TrackAudio(_StrictExitMixin, FFmpegPCMAudio):
     """PCM path: decode, volume/effects, re-encode by discord.py."""
-
-
-class TrackOpusAudio(_StrictExitMixin, FFmpegOpusAudio):
-    """Passthrough path: remux Opus with `-c:a copy`, no decode/re-encode."""
-
-    def __init__(self, source, **kwargs):
-        super().__init__(source, codec="copy", **kwargs)
 
 
 class VolumeAudio(PCMVolumeTransformer):

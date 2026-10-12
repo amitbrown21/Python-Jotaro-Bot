@@ -7,7 +7,7 @@ from typing import Optional
 import discord
 import yt_dlp
 
-from music_audio import info_is_opus, stream_url_stale, ytdlp_failure_hint
+from music_audio import stream_url_stale, ytdlp_failure_hint
 from music_store import SongInfo, pick_related_entry
 
 log = logging.getLogger(__name__)
@@ -49,7 +49,6 @@ class SourcesMixin:
         if not audio:
             return False
         song.audio_url = audio
-        song.is_opus = info_is_opus(info)
         song._audio = None
         return True
 
@@ -136,5 +135,4 @@ class SourcesMixin:
             requester_id=requester.id if requester else None,
             requester_name=requester.display_name if requester else None,
         )
-        song.is_opus = info_is_opus(info)
         return song

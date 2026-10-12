@@ -358,7 +358,6 @@ class SongInfo:
         self.requester_id = requester_id
         self.requester_name = requester_name
         self.playback_retried = False
-        self.is_opus = False  # set when yt-dlp resolved an Opus stream (passthrough-able)
         self._preload: Optional[asyncio.Task] = None
         self._audio: Optional[FFmpegPCMAudio] = None
 

@@ -33,8 +33,6 @@ from music_cog import (
     stream_url_stale,
     tracks_from_queue,
     PlayClock,
-    choose_audio_path,
-    info_is_opus,
     should_reconnect,
     should_advance,
     ytdlp_failure_hint,
@@ -509,17 +507,99 @@ def test_lazy_stream_resolve():
     asyncio.run(run())
 
 
-def test_audio_path_choice():
-    assert choose_audio_path(100, "off", 0, True) == "opus"
-    assert choose_audio_path(100, "off", 0, False) == "pcm"
-    assert choose_audio_path(80, "off", 0, True) == "pcm"
-    assert choose_audio_path(100, "bass", 0, True) == "pcm"
-    assert choose_audio_path(100, "nightcore", 0, True) == "pcm"
-    assert choose_audio_path(100, "off", 30, True) == "pcm"
-    assert choose_audio_path(0, "off", 0, True) == "pcm"
-    assert info_is_opus({"acodec": "opus"}) is True
-    assert info_is_opus({"acodec": "mp4a.40.2"}) is False
-    assert info_is_opus({}) is False and info_is_opus(None) is False
+def test_stream_buffering_options():
+    # Reconnect keeps a dropped CDN connection alive mid-song; a bounded
+    # rw_timeout lets after_play refresh+resume a stalled read instead of
+    # leaving long silence.
+    assert "-reconnect 1" in FFMPEG_BEFORE
+    assert "-reconnect_streamed 1" in FFMPEG_BEFORE
+    assert "-reconnect_on_http_error 4xx,5xx" in FFMPEG_BEFORE
+    assert "-rw_timeout 8000000" in FFMPEG_BEFORE
+    assert "-thread_queue_size 512" in FFMPEG_BEFORE
+    # -buffer_size is a tcp/socket option; an http input aborts with
+    # "Option buffer_size not found", so it must never come back.
+    assert "-buffer_size" not in FFMPEG_BEFORE
+    # no -re (read ahead for buffer) and no +nobuffer (that is what makes bots stutter)
+    assert " -re " not in f" {FFMPEG_BEFORE} "
+    assert "+nobuffer" not in FFMPEG_BEFORE
+    # discord.py pins every decoded source to s16le/48kHz/stereo itself, so our
+    # options only strip non-audio streams (no duplicate -ar/-ac warnings)
+    assert FFMPEG_OPTIONS == "-vn -sn -dn"
+
+
+def test_play_audio_always_builds_pcm_volume_source():
+    """The codec="copy" passthrough is gone: play_audio must decode every track
+    to the pinned 48kHz PCM and wrap it in a volume transformer, then hand the
+    channel bitrate to voice.play. Guards the 'sometimes speeds up' regression."""
+    import music_playback as pb
+
+    seen = {}
+    real_track, real_volume = pb.TrackAudio, pb.VolumeAudio
+
+    class FakeTrack:
+        def __init__(self, url, *, before_options=None, options=None):
+            seen["url"], seen["before"], seen["options"] = url, before_options, options
+
+    class FakeVolume:
+        def __init__(self, original, volume):
+            seen["inner"], seen["volume"] = original, volume
+
+    pb.TrackAudio, pb.VolumeAudio = FakeTrack, FakeVolume
+
+    class Channel:
+        id, bitrate = 42, 256000
+
+    class Guild:
+        id = 7
+
+    class Voice:
+        def __init__(self):
+            self.guild, self.channel, self.called = Guild(), Channel(), None
+
+        def play(self, source, **kwargs):
+            self.called = (source, kwargs)
+
+    class Host(pb.PlaybackMixin):
+        def __init__(self, effect="off", volume=100):
+            self._effect, self._volume = effect, volume
+
+        def get_queue(self, guild_id):
+            q = GuildQueue()
+            q.effect = self._effect
+            return q
+
+        def get_volume_percent(self, channel_id):
+            return self._volume
+
+    def song_for(title):
+        s = _song(title)
+        s.audio_url = f"https://rr.googlevideo.com/videoplayback?expire=9999999999&id={title}"
+        s.ffmpeg_options = {"before_options": FFMPEG_BEFORE, "options": FFMPEG_OPTIONS}
+        return s
+
+    try:
+        # default: 100% volume, no effect
+        voice = Voice()
+        Host().play_audio(voice, song_for("A"), None)
+        assert isinstance(seen["inner"], FakeTrack)  # decoded source, never an opus copy
+        assert seen["url"].startswith("https://rr.googlevideo.com")
+        assert seen["before"] == FFMPEG_BEFORE
+        assert seen["options"] == FFMPEG_OPTIONS  # effect off -> no -af
+        assert seen["volume"] == 1.0  # 100% -> unity gain
+        source, kwargs = voice.called
+        assert isinstance(source, FakeVolume)  # always wrapped, so volume works live
+        assert kwargs["bitrate"] == 256  # opus_bitrate(256000)
+        assert kwargs["expected_packet_loss"] == 0.05
+        assert callable(kwargs["after"])
+
+        # non-unity volume + effect still take the same pinned PCM path
+        voice2 = Voice()
+        Host(effect="bass", volume=40).play_audio(voice2, song_for("B"), None)
+        assert seen["volume"] == 0.4
+        assert "bass=g=8" in seen["options"]
+        assert isinstance(voice2.called[0], FakeVolume)
+    finally:
+        pb.TrackAudio, pb.VolumeAudio = real_track, real_volume
 
 
 def test_play_clock_and_reconnect_rule():
@@ -661,7 +741,8 @@ if __name__ == "__main__":
     test_playlist_picker_helpers()
     test_logging_and_ytdlp_age()
     test_help_matches_commands()
-    test_audio_path_choice()
+    test_stream_buffering_options()
+    test_play_audio_always_builds_pcm_volume_source()
     test_play_clock_and_reconnect_rule()
     test_saved_queue_roundtrip()
     test_flat_playlist_to_songs()

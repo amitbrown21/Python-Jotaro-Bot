@@ -15,12 +15,9 @@ from music_audio import (  # noqa: F401  (re-exported: main.py and test_offline.
     YTDL_FORMAT,
     PlayClock,
     TrackAudio,
-    TrackOpusAudio,
     VolumeAudio,
     build_ffmpeg_options,
-    choose_audio_path,
     fetch_lyrics,
-    info_is_opus,
     opus_bitrate,
     parse_seek,
     should_advance,
@@ -606,10 +603,6 @@ class music_cog(PlaybackMixin, SourcesMixin, commands.Cog):
         voice = interaction.guild.voice_client
         if voice and voice.source and hasattr(voice.source, "volume"):
             voice.source.volume = int(level) / 100.0
-        elif voice and isinstance(voice.source, TrackOpusAudio) and int(level) != 100:
-            # Passthrough has no gain stage: rebuild on the PCM path at the same position.
-            queue = self.get_queue(interaction.guild_id)
-            self.restart_current(voice, interaction, seek=queue.clock.position())
 
         await interaction.response.send_message(
             f"Volume set to {int(level)}%, Yare Yare..."

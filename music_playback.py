@@ -1,4 +1,4 @@
-"""Playback engine: audio path choice, play/advance/retry, voice reconnect. Mixed into music_cog."""
+"""Playback engine: source building, play/advance/retry, voice reconnect. Mixed into music_cog."""
 import asyncio
 import logging
 import time
@@ -8,10 +8,8 @@ import discord
 
 from music_audio import (
     TrackAudio,
-    TrackOpusAudio,
     VolumeAudio,
     build_ffmpeg_options,
-    choose_audio_path,
     opus_bitrate,
     should_advance,
     should_reconnect,
@@ -36,13 +34,12 @@ class PlaybackMixin:
         queue = self.get_queue(voice.guild.id)
         vol_pct = self.get_volume_percent(voice.channel.id)
         opts = build_ffmpeg_options(song.ffmpeg_options, queue.effect, seek)
-        path = choose_audio_path(vol_pct, queue.effect, seek, song.is_opus)
-        if path == "opus":
-            source = TrackOpusAudio(song.audio_url, **opts)
-        else:
-            source = VolumeAudio(TrackAudio(song.audio_url, **opts), volume=vol_pct / 100.0)
-        log.debug("play %r via %s path (vol=%s effect=%s seek=%s)",
-                  song.title, path, vol_pct, queue.effect, seek)
+        # Always decode and re-encode through libopus: the output is pinned to
+        # 48kHz/stereo here, so a source at any rate can't play at the wrong speed,
+        # and volume/effects apply per track without rebuilding the source.
+        source = VolumeAudio(TrackAudio(song.audio_url, **opts), volume=vol_pct / 100.0)
+        log.debug("play %r (vol=%s effect=%s seek=%s)",
+                  song.title, vol_pct, queue.effect, seek)
         gen = queue.play_gen
         queue.clock.start(seek)
         voice.play(
