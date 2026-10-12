@@ -1089,7 +1089,3 @@ class music_cog(PlaybackMixin, SourcesMixin, commands.Cog):
             )
         except Exception as e:
             await interaction.followup.send(f"Error playing {filename}: {e}")
-
-
-async def setup(bot: commands.Bot):
-    await bot.add_cog(music_cog(bot))

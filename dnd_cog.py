@@ -171,7 +171,3 @@ class dnd_cog(commands.Cog):
         await interaction.response.send_message(
             f"You found: {loot} (Rarity: {rarity_value.replace('_', ' ').title()})"
         )
-
-
-async def setup(client):
-    await client.add_cog(dnd_cog(client))

@@ -119,7 +119,3 @@ class admin_cog(commands.Cog):
             await interaction.followup.send(
                 "Error syncing commands - check permissions", ephemeral=True
             )
-
-
-async def setup(bot):
-    await bot.add_cog(admin_cog(bot))
