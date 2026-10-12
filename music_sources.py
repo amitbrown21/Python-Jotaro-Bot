@@ -49,7 +49,6 @@ class SourcesMixin:
         if not audio:
             return False
         song.audio_url = audio
-        song._audio = None
         return True
 
     async def _ensure_stream(self, song: SongInfo):

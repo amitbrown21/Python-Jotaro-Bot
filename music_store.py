@@ -7,9 +7,7 @@ import re
 import tempfile
 from typing import Optional
 
-from discord import FFmpegPCMAudio
-
-from music_audio import PlayClock, TrackAudio
+from music_audio import PlayClock
 
 def volumes_path() -> str:
     return "/config/volumes.json" if os.path.isdir("/config") else "./volumes.json"
@@ -359,13 +357,6 @@ class SongInfo:
         self.requester_name = requester_name
         self.playback_retried = False
         self._preload: Optional[asyncio.Task] = None
-        self._audio: Optional[FFmpegPCMAudio] = None
-
-    @property
-    def audio(self) -> FFmpegPCMAudio:
-        if self._audio is None:
-            self._audio = TrackAudio(self.audio_url, **self.ffmpeg_options)
-        return self._audio
 
 
 class GuildQueue:

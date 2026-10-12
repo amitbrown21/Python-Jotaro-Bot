@@ -42,19 +42,25 @@ USER_AGENT = (
 )
 
 
-# Input-side read-ahead for HTTP (googlevideo). Reconnect keeps a dropped CDN
-# connection alive mid-song; a bounded rw_timeout (microseconds) makes a stalled
-# read fail fast so after_play's refresh+resume recovers instead of leaving long
-# silence. -thread_queue_size is the demuxer read-ahead. Do NOT add -buffer_size:
-# it is a tcp/socket option, and http inputs reject it ("Option buffer_size not
-# found") which aborts opening the stream. Do not add +nobuffer either — that
-# trades buffer for latency and is what makes Discord bots stutter.
+# Input side. -user_agent: googlevideo answers ffmpeg's default "Lavf/.." UA with
+# HTTP 403 (see USER_AGENT). -reconnect*: ride out a dropped CDN connection in place,
+# which beats after_play's refresh+resume because that one resumes from the position
+# clock and so skips the silent seconds. Only 5xx is retried: a 403 on a signed URL is
+# terminal, so retrying it just burns seconds and re-hammers a CDN already refusing this
+# host. -reconnect_on_network_error is NOT on by default (help says false), so it is
+# spelled out. -rw_timeout (microseconds) is the only stall bound ffmpeg 7 still
+# exposes; 4s is ~4000x a healthy read, so it trips on a real stall without aborting a
+# merely slow link. -probesize/-analyzeduration cap probing (ffmpeg defaults to 5MB):
+# free on a direct audio URL, quicker start on a live/HLS one. Do NOT add -buffer_size:
+# it is a tcp/socket option and http inputs reject it ("Option buffer_size not found"),
+# aborting the open. Do not add +nobuffer either: trading buffer for latency is what
+# makes Discord bots stutter. -thread_queue_size and -fflags +genpts+discardcorrupt
+# measured byte-identical (inert) on the WebM/Opus path and are gone.
 FFMPEG_BEFORE = (
     f'-user_agent "{USER_AGENT}" '
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
-    "-reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx "
-    "-rw_timeout 8000000 -thread_queue_size 512 "
-    "-fflags +genpts+discardcorrupt "
+    "-reconnect_on_network_error 1 -reconnect_on_http_error 5xx "
+    "-rw_timeout 4000000 "
     "-nostdin -probesize 1M -analyzeduration 1M"
 )
 
@@ -65,22 +71,11 @@ FFMPEG_BEFORE = (
 # just make ffmpeg warn about duplicate options on every track.
 FFMPEG_OPTIONS = "-vn -sn -dn"
 
-PRELOAD_DEPTH = 2
-
 
 def opus_bitrate(channel_bitrate: Optional[int]) -> int:
     """kbps for the encoder: never below 128, up to 256 when the channel allows it."""
     kbps = int(channel_bitrate or 0) // 1000
     return max(128, min(256, kbps))
-
-
-def songs_to_preload(songs, now: float, depth: int = PRELOAD_DEPTH) -> list:
-    """Upcoming queue entries whose stream URL is missing or expired."""
-    return [
-        song
-        for song in list(songs)[:depth]
-        if getattr(song, "url", None) and stream_url_stale(getattr(song, "audio_url", None), now)
-    ]
 
 
 class PlayClock:
@@ -145,7 +140,10 @@ def ytdlp_failure_hint(message: str) -> str:
 
 
 _EFFECT_AF = {
-    "bass": "bass=g=8,alimiter=limit=0.95",
+    # level=0 disables alimiter's auto-level. With it on the limiter normalises the
+    # output back to 0dBFS (measured: peak 1.000 on a hot bass source), so the 0.95
+    # limit is ignored and loud masters pump. Off, it is a clean -0.45dBFS ceiling.
+    "bass": "bass=g=8,alimiter=limit=0.95:level=0",
     "nightcore": "asetrate=48000*1.25,aresample=48000",
 }
 
@@ -185,13 +183,19 @@ def ytdl_client_options() -> dict:
     Always pins the browser UA so yt-dlp's extraction and the ffmpeg media fetch agree.
     YTDLP_COOKIES points at a Netscape cookies.txt (the reliable fix once YouTube
     blocks the host's IP) and YTDLP_PLAYER_CLIENT overrides the YouTube client, e.g.
-    "web_safari,tv". Both stay inert when unset, so a typo cannot poison every fetch.
+    "tv_embedded" (web_safari/tv need a JS runtime this image does not ship). Both
+    stay inert when unset, so a typo cannot poison every fetch.
     """
     opts = {"http_headers": {"User-Agent": USER_AGENT}}
     cookies = os.getenv("YTDLP_COOKIES", "").strip()
     if cookies:
-        opts["cookiefile"] = cookies
-        log.info("yt-dlp: using cookies from %s", cookies)
+        # yt-dlp silently ignores an unreadable path, so say so rather than claiming
+        # to use cookies that were never loaded.
+        if os.access(cookies, os.R_OK):
+            opts["cookiefile"] = cookies
+            log.info("yt-dlp: using cookies from %s", cookies)
+        else:
+            log.warning("YTDLP_COOKIES %s is not readable; ignoring it", cookies)
     client = os.getenv("YTDLP_PLAYER_CLIENT", "").strip()
     if client:
         opts["extractor_args"] = {

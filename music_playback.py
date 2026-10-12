@@ -30,7 +30,6 @@ class PlaybackMixin:
         seek: int = 0,
     ):
         # FFmpeg sources cannot be replayed after stop; always build a fresh source.
-        song._audio = None
         queue = self.get_queue(voice.guild.id)
         vol_pct = self.get_volume_percent(voice.channel.id)
         opts = build_ffmpeg_options(song.ffmpeg_options, queue.effect, seek)

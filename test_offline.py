@@ -5,6 +5,7 @@ import tempfile
 os.environ.setdefault("DISCORD_TOKEN", "dummy-token-for-offline-tests")  # config.py requires one
 
 import discord
+import yt_dlp
 
 from admin_cog import HELP_SECTIONS, build_help_embed, help_command_names, admin_cog
 from dnd_cog import dnd_cog, roll_dice_expr
@@ -461,7 +462,7 @@ def test_flat_playlist_to_songs():
         tracks + [{"title": "bad", "url": "nope"}, {}], opts, User()
     )
     assert [s.title for s in songs] == ["A", "C", "D"]
-    assert all(s.audio_url == "" and s._audio is None for s in songs)
+    assert all(s.audio_url == "" for s in songs)
     assert songs[0].requester_id == 7 and songs[0].requester_name == "Jotaro"
     assert songs[0].thumbnail == "big"
     assert stream_url_stale(songs[0].audio_url, 0) is True  # lazy: needs resolving
@@ -510,27 +511,33 @@ def test_lazy_stream_resolve():
 
 
 def test_stream_buffering_options():
-    # Reconnect keeps a dropped CDN connection alive mid-song; a bounded
-    # rw_timeout lets after_play refresh+resume a stalled read instead of
-    # leaving long silence.
+    # googlevideo answers ffmpeg's default "Lavf/.." UA with 403, so the media fetch
+    # must identify as the same browser yt-dlp extracted with.
+    assert f'-user_agent "{USER_AGENT}"' in FFMPEG_BEFORE
+    assert USER_AGENT.startswith("Mozilla/5.0")
+    # Reconnect keeps a dropped CDN connection alive mid-song; a bounded rw_timeout
+    # (microseconds) lets after_play refresh+resume a stalled read instead of leaving
+    # long silence.
     assert "-reconnect 1" in FFMPEG_BEFORE
     assert "-reconnect_streamed 1" in FFMPEG_BEFORE
-    assert "-reconnect_on_http_error 4xx,5xx" in FFMPEG_BEFORE
-    assert "-rw_timeout 8000000" in FFMPEG_BEFORE
-    assert "-thread_queue_size 512" in FFMPEG_BEFORE
+    assert "-rw_timeout 4000000" in FFMPEG_BEFORE
+    # A 403 on a signed URL is terminal, so only 5xx is worth retrying: retrying 4xx
+    # costs ~4s before recovery and re-hammers a CDN already refusing this host.
+    assert "-reconnect_on_http_error 5xx" in FFMPEG_BEFORE
+    assert "4xx" not in FFMPEG_BEFORE
     # -buffer_size is a tcp/socket option; an http input aborts with
     # "Option buffer_size not found", so it must never come back.
     assert "-buffer_size" not in FFMPEG_BEFORE
     # no -re (read ahead for buffer) and no +nobuffer (that is what makes bots stutter)
     assert " -re " not in f" {FFMPEG_BEFORE} "
     assert "+nobuffer" not in FFMPEG_BEFORE
+    # measured byte-identical (inert) on the WebM/Opus path, so they are gone;
+    # -thread_queue_size would only be a ~10s read-ahead on an older ffmpeg
+    assert "-thread_queue_size" not in FFMPEG_BEFORE
+    assert "-fflags" not in FFMPEG_BEFORE
     # discord.py pins every decoded source to s16le/48kHz/stereo itself, so our
     # options only strip non-audio streams (no duplicate -ar/-ac warnings)
     assert FFMPEG_OPTIONS == "-vn -sn -dn"
-    # googlevideo answers ffmpeg's default "Lavf/.." UA with 403, so the media fetch
-    # must identify as the same browser yt-dlp extracted with.
-    assert f'-user_agent "{USER_AGENT}"' in FFMPEG_BEFORE
-    assert USER_AGENT.startswith("Mozilla/5.0")
 
 
 def test_ytdl_identity_and_403_escape_hatches():
@@ -542,22 +549,98 @@ def test_ytdl_identity_and_403_escape_hatches():
     try:
         plain = ytdl_client_options()
         assert plain == {"http_headers": {"User-Agent": USER_AGENT}}
+        # yt-dlp silently ignores unknown option keys, so a one-letter typo would keep
+        # this test green while killing the whole 403 fix. Prove the key lands.
+        assert yt_dlp.YoutubeDL(plain).params["http_headers"]["User-Agent"] == USER_AGENT
         # a blank variable is not an empty path / empty client list
         os.environ["YTDLP_COOKIES"] = "   "
         assert "cookiefile" not in ytdl_client_options()
 
+        # an unreadable path is ignored, never passed through to yt-dlp
         os.environ["YTDLP_COOKIES"] = "  /config/cookies.txt  "
-        os.environ["YTDLP_PLAYER_CLIENT"] = "web_safari, tv"
-        tuned = ytdl_client_options()
-        assert tuned["cookiefile"] == "/config/cookies.txt"  # trimmed
-        assert tuned["extractor_args"] == {"youtube": {"player_client": ["web_safari", "tv"]}}
-        assert tuned["http_headers"]["User-Agent"] == USER_AGENT
+        assert "cookiefile" not in ytdl_client_options()
+
+        # a readable path is used (trimmed) and the client list is split
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            cookie_file = fh.name
+        try:
+            os.environ["YTDLP_COOKIES"] = f"  {cookie_file}  "
+            os.environ["YTDLP_PLAYER_CLIENT"] = "tv_embedded, bogus"
+            tuned = ytdl_client_options()
+            assert tuned["cookiefile"] == cookie_file  # trimmed
+            assert tuned["extractor_args"] == {
+                "youtube": {"player_client": ["tv_embedded", "bogus"]}
+            }
+            assert tuned["http_headers"]["User-Agent"] == USER_AGENT
+        finally:
+            os.remove(cookie_file)
     finally:
         for key, value in saved.items():
             if value is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+def test_after_play_routing():
+    """after_play is the only recovery path for a mid-stream death (a 403 storm, a
+    dropped CDN socket), so pin its four outcomes and the stale-player guard."""
+    import music_playback as pb
+
+    scheduled = []
+    real_rc = pb.asyncio.run_coroutine_threadsafe
+
+    def fake_rc(coro, loop):
+        scheduled.append(coro.__qualname__)
+        coro.close()  # never awaited here
+
+    pb.asyncio.run_coroutine_threadsafe = fake_rc
+
+    class Host(pb.PlaybackMixin):
+        client = type("Client", (), {"loop": None})()
+
+        def __init__(self):
+            self.q = GuildQueue()
+
+        def get_queue(self, guild_id):
+            return self.q
+
+    interaction = type("Inter", (), {"guild_id": 1})()
+    try:
+        host = Host()
+        song = _song("A")
+        host.q.current = song
+
+        # a stale player (seek/effect rebuilt the source) is ignored, even on error
+        host.q.play_gen = 3
+        host.after_play(interaction, RuntimeError("exit 8"), song, 2)
+        assert scheduled == []
+
+        # a real ffmpeg error rebuilds the song once from a freshly extracted URL
+        host.q.play_gen = 0
+        host.after_play(interaction, RuntimeError("exit 8"), song, 0)
+        assert len(scheduled) == 1 and scheduled[0].endswith("_retry_playback")
+        assert song.playback_retried is True
+
+        # still failing on the retry: advance instead of looping forever
+        scheduled.clear()
+        host.after_play(interaction, RuntimeError("exit 8"), song, 0)
+        assert len(scheduled) == 1 and scheduled[0].endswith("play_next")
+
+        # a deliberate stop clears the flags and must not advance
+        scheduled.clear()
+        host.q.stopping = True
+        host.after_play(interaction, None, song, 0)
+        assert scheduled == [] and host.q.stopping is False
+
+        # a paused player dying (voice drop) stays put; reconnect/resume handles it
+        scheduled.clear()
+        host.q.clock.start(0, now=0)
+        host.q.clock.pause(now=1)
+        host.after_play(interaction, None, song, 0)
+        assert scheduled == []
+    finally:
+        pb.asyncio.run_coroutine_threadsafe = real_rc
 
 
 def test_play_audio_always_builds_pcm_volume_source():
@@ -776,6 +859,7 @@ if __name__ == "__main__":
     test_help_matches_commands()
     test_stream_buffering_options()
     test_ytdl_identity_and_403_escape_hatches()
+    test_after_play_routing()
     test_play_audio_always_builds_pcm_volume_source()
     test_play_clock_and_reconnect_rule()
     test_saved_queue_roundtrip()
