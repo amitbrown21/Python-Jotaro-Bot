@@ -22,6 +22,17 @@ log = logging.getLogger(__name__)
 
 
 class PlaybackMixin:
+    def _play_source(self, voice: discord.VoiceClient, source, after):
+        """One place for the encoder policy: bitrate from the channel, 5% packet-loss
+        tolerance. Stops a second caller from silently falling back to discord.py's
+        128 kbps default on a channel that allows 256."""
+        voice.play(
+            source,
+            after=after,
+            bitrate=opus_bitrate(getattr(voice.channel, "bitrate", None)),
+            expected_packet_loss=0.05,
+        )
+
     def play_audio(
         self,
         voice: discord.VoiceClient,
@@ -41,11 +52,10 @@ class PlaybackMixin:
                   song.title, vol_pct, queue.effect, seek)
         gen = queue.play_gen
         queue.clock.start(seek)
-        voice.play(
+        self._play_source(
+            voice,
             source,
-            after=lambda error, s=song, g=gen: self.after_play(interaction, error, s, g),
-            bitrate=opus_bitrate(getattr(voice.channel, "bitrate", None)),
-            expected_packet_loss=0.05,
+            lambda error, s=song, g=gen: self.after_play(interaction, error, s, g),
         )
 
     def restart_current(

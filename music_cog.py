@@ -6,7 +6,7 @@ from typing import Dict, Optional
 
 import discord
 import yt_dlp
-from discord import FFmpegPCMAudio, app_commands
+from discord import app_commands
 from discord.ext import commands
 
 from music_audio import (  # noqa: F401  (re-exported: main.py and test_offline.py import from here)
@@ -1074,12 +1074,13 @@ class music_cog(PlaybackMixin, SourcesMixin, commands.Cog):
 
         try:
             vol = self.get_volume_percent(voice.channel.id) / 100.0
-            source = discord.PCMVolumeTransformer(
-                FFmpegPCMAudio(song_path), volume=vol
-            )
-            voice.play(
+            # Same primitives and encoder policy as the queue path (_play_source), so a
+            # local mp3 is not quietly sent at discord.py's 128 kbps default.
+            source = VolumeAudio(TrackAudio(song_path), volume=vol)
+            self._play_source(
+                voice,
                 source,
-                after=lambda x=None: self.after_play(interaction),
+                lambda error=None: self.after_play(interaction, error),
             )
             await interaction.followup.send(
                 f"Now playing: {filename}",
